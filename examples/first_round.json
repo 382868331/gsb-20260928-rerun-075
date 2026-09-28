@@ -1,0 +1,21 @@
+{
+  "name": "首轮-延迟与中断",
+  "description": "虚拟服务链上对 billing 注入延迟、对 inventory 注入中断，并验证重叠注入的独立撤销。",
+  "seed": 20260929,
+  "cancel_at_ms": null,
+  "requests": [
+    {"at_ms": 50, "payload": {"user": "alice", "amount": 100}},
+    {"at_ms": 150, "payload": {"user": "bob", "amount": 55}},
+    {"at_ms": 250, "payload": {"user": "carol", "amount": 230}},
+    {"at_ms": 350, "payload": {"user": "dave", "amount": 8}},
+    {"at_ms": 450, "payload": {"user": "erin", "amount": 77}}
+  ],
+  "injections": [
+    {"id": "lat-1", "type": "latency", "target": "billing",
+     "start_ms": 100, "end_ms": 400, "params": {"delay_ms": 50}},
+    {"id": "lat-2", "type": "latency", "target": "billing",
+     "start_ms": 200, "end_ms": 300, "params": {"delay_ms": 30}},
+    {"id": "break-1", "type": "interruption", "target": "inventory",
+     "start_ms": 220, "end_ms": 280}
+  ]
+}

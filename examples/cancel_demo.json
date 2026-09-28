@@ -1,0 +1,17 @@
+{
+  "name": "取消恢复演示",
+  "description": "实验在故障生效期间取消，仍生效的注入必须全部撤销。",
+  "seed": 777,
+  "cancel_at_ms": 260,
+  "requests": [
+    {"at_ms": 50, "payload": {"order": "A1"}},
+    {"at_ms": 150, "payload": {"order": "A2"}},
+    {"at_ms": 300, "payload": {"order": "A3"}}
+  ],
+  "injections": [
+    {"id": "lat-open", "type": "latency", "target": "auth",
+     "start_ms": 100, "end_ms": null, "params": {"delay_ms": 40}},
+    {"id": "break-open", "type": "interruption", "target": "billing",
+     "start_ms": 120, "end_ms": null}
+  ]
+}

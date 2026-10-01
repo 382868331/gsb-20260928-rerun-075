@@ -1,0 +1,20 @@
+{
+  "name": "依赖链-延迟触发超时再影响重试",
+  "description": "billing 延迟注入生效后，观察到单跳延迟超过 60ms 才触发超时注入；超时导致请求失败并按 retries 重试，重试同样命中超时。",
+  "seed": 20261001,
+  "cancel_at_ms": null,
+  "requests": [
+    {"at_ms": 50, "payload": {"order": "D1"}, "retries": 2},
+    {"at_ms": 150, "payload": {"order": "D2"}, "retries": 2},
+    {"at_ms": 250, "payload": {"order": "D3"}, "retries": 2},
+    {"at_ms": 600, "payload": {"order": "D4"}, "retries": 2}
+  ],
+  "injections": [
+    {"id": "lat-slow", "type": "latency", "target": "billing",
+     "start_ms": 100, "end_ms": 500, "params": {"delay_ms": 80}},
+    {"id": "tmo-derived", "type": "timeout", "target": "billing",
+     "start_ms": 100, "end_ms": 500, "params": {"threshold_ms": 50},
+     "depends_on": ["lat-slow"],
+     "start_when": {"kind": "latency_at_least", "target": "billing", "ms": 60}}
+  ]
+}

@@ -1,0 +1,20 @@
+{
+  "name": "提前停止-连续失败",
+  "description": "auth 中断导致连续失败，达到 stop_when 条件后实验提前停止，后续请求记为 not_executed；与取消同刻的请求按规则照常完成。",
+  "seed": 99,
+  "cancel_at_ms": null,
+  "stop_when": [
+    {"kind": "consecutive_failures", "count": 2}
+  ],
+  "requests": [
+    {"at_ms": 50, "payload": {"n": 1}},
+    {"at_ms": 150, "payload": {"n": 2}},
+    {"at_ms": 250, "payload": {"n": 3}},
+    {"at_ms": 350, "payload": {"n": 4}},
+    {"at_ms": 450, "payload": {"n": 5}}
+  ],
+  "injections": [
+    {"id": "break-auth", "type": "interruption", "target": "auth",
+     "start_ms": 100, "end_ms": null}
+  ]
+}

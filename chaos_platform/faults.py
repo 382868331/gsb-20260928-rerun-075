@@ -59,6 +59,30 @@ class InterruptionFault:
         )
 
 
+@dataclass(frozen=True)
+class TimeoutFault:
+    """超时故障：生效期间，目标节点单跳耗时超过 threshold_ms 即判定超时。
+
+    常作为依赖型故障使用（如延迟积累触发超时），但本身只关心阈值，
+    是否生效由运行控制的依赖/条件机制决定。
+    """
+
+    type_name: str = "timeout"
+
+    def create_handle(self, spec: InjectionSpec) -> EffectHandle:
+        threshold_ms = spec.params.get("threshold_ms")
+        if not isinstance(threshold_ms, (int, float)) or threshold_ms < 0:
+            raise ValueError(f"注入 {spec.id} 的 threshold_ms 必须是非负数")
+        return EffectHandle(
+            injection_id=spec.id,
+            type_name=self.type_name,
+            target=spec.target,
+            aspect="timeout",
+            value_ns=int(threshold_ms * 1_000_000),
+            detail={"threshold_ms": threshold_ms},
+        )
+
+
 class FaultRegistry:
     def __init__(self) -> None:
         self._types: dict[str, FaultType] = {}
@@ -82,6 +106,7 @@ class FaultRegistry:
 fault_registry = FaultRegistry()
 fault_registry.register(LatencyFault())
 fault_registry.register(InterruptionFault())
+fault_registry.register(TimeoutFault())
 
 
 @dataclass
@@ -166,8 +191,28 @@ class FaultManager:
             for active in self._effects.get(("latency", target), [])
         )
 
+    def latency_contributions(self, target: str) -> dict[str, int]:
+        """目标节点当前每个延迟注入各自贡献的附加延迟（ns）。"""
+        return {
+            active.handle.injection_id: active.handle.value_ns
+            for active in self._effects.get(("latency", target), [])
+        }
+
     def interruption_active(self, target: str) -> bool:
         return bool(self._effects.get(("interruption", target)))
+
+    def interruption_sources(self, target: str) -> list[str]:
+        return [
+            active.handle.injection_id
+            for active in self._effects.get(("interruption", target), [])
+        ]
+
+    def timeout_limits(self, target: str) -> dict[str, int]:
+        """目标节点当前每个超时注入各自的阈值（ns）。"""
+        return {
+            active.handle.injection_id: active.handle.value_ns
+            for active in self._effects.get(("timeout", target), [])
+        }
 
     def is_empty(self) -> bool:
         return not self.active_ids()

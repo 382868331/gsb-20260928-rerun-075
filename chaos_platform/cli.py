@@ -16,14 +16,35 @@ def _print_summary(result_dict: dict) -> None:
     if result["cancelled"]:
         print(f"实验在 {result['cancel_at_ms']}ms 被取消，撤销故障: "
               + ", ".join(r["id"] for r in result["recovered"]))
+    if result.get("stopped"):
+        print(f"实验在 {result['stopped_at_ms']}ms 提前停止（{result['stop_reason']}），"
+              f"撤销故障: " + ", ".join(r["id"] for r in result["recovered"]))
     affected = [c for c in result["comparisons"]
                 if c["status_changed"] or c["latency_delta_ns"] != 0]
     print(f"请求数: {len(result['comparisons'])}，受影响: {len(affected)}")
     for comp in affected:
         delta_ms = comp["latency_delta_ns"] / 1_000_000
         note = comp["fault_status"] if comp["status_changed"] else f"+{delta_ms:g}ms"
+        sources = ", ".join(comp.get("attributed_to", [])) or "无"
         print(f"  #{comp['request_id']} @{comp['at_ms']}ms: "
-              f"{comp['control_status']} -> {note}")
+              f"{comp['control_status']} -> {note}  (来源注入: {sources})")
+
+
+def _first_divergence(saved: dict, replayed: dict) -> str:
+    """逐事件比对，返回第一处不一致的描述。"""
+    saved_events = saved.get("event_log", [])
+    new_events = replayed.get("event_log", [])
+    for idx, (old, new) in enumerate(zip(saved_events, new_events)):
+        if old != new:
+            return (f"事件 #{idx} 不一致:\n  保存: {old}\n  重放: {new}")
+    if len(saved_events) != len(new_events):
+        return f"事件数量不一致: 保存 {len(saved_events)}，重放 {len(new_events)}"
+    saved_obs = saved.get("observations", [])
+    new_obs = replayed.get("observations", [])
+    for idx, (old, new) in enumerate(zip(saved_obs, new_obs)):
+        if old != new:
+            return f"观察记录 #{idx} (request {old.get('request_id')}) 不一致"
+    return "结果字段不一致（事件与观察记录均相同）"
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -60,8 +81,13 @@ def main(argv: list[str] | None = None) -> int:
         result = ExperimentRunner().run(scenario).to_dict()
         if result != saved["result"]:
             print("重放结果与保存报告不一致")
+            print(_first_divergence(saved["result"], result))
             return 1
         print("重放结果与保存报告完全一致")
+        for event in saved["result"].get("event_log", []):
+            print(f"  [{event['seq']:>3}] @{event['at_ms']}ms {event['kind']}"
+                  + "".join(f" {k}={v}" for k, v in event.items()
+                            if k not in ("seq", "at_ms", "kind")))
         _print_summary(saved)
         return 0
     return 0

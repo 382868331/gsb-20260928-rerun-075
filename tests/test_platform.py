@@ -130,3 +130,137 @@ def test_example_scenarios_run_and_replay(tmp_path: Path):
     report = tmp_path / "r.json"
     assert cli_main(["run", str(examples / "cancel_demo.json"), "-o", str(report)]) == 0
     assert cli_main(["replay", str(report)]) == 0
+
+
+def _dependency_scenario():
+    return Scenario(
+        name="dep", seed=7,
+        requests=[RequestSpec(at_ms=t, retries=2)
+                  for t in (50, 150, 250, 600)],
+        injections=[
+            InjectionSpec("lat", "latency", "billing", 100, 500,
+                          {"delay_ms": 80}),
+            InjectionSpec("tmo", "timeout", "billing", 100, 500,
+                          {"threshold_ms": 50},
+                          depends_on=["lat"],
+                          start_when={"kind": "latency_at_least",
+                                      "target": "billing", "ms": 60}),
+        ],
+    )
+
+
+def test_dependent_timeout_fires_only_after_observed_latency():
+    result = ExperimentRunner().run(_dependency_scenario())
+    events = result.event_log
+    fired = next(e for e in events
+                 if e["kind"] == "inject_start" and e.get("id") == "tmo")
+    # 超时注入不是在 start_ms=100 生效，而是在第一次观察到 billing 延迟超标后
+    assert fired["at_ms"] == 150
+    assert fired["conditional"] is True
+    # 生效前（@50/@150）请求与对照组一致；生效后（@250）超时且重试也失败
+    by_request = {c.request_id: c for c in result.comparisons}
+    assert by_request[0].status_changed is False
+    assert by_request[1].status_changed is False
+    assert by_request[2].fault_status == "timeout"
+    obs = {o.request_id: o for o in result.observations if o.group == "fault"}
+    assert len(obs[2].attempts) == 3  # 1 次原始 + 2 次重试，全部超时
+    assert all(a["status"] == "timeout" for a in obs[2].attempts)
+    # 延迟结束后（@600）超时注入也随窗口结束，请求恢复
+    assert by_request[3].status_changed is False
+
+
+def test_impact_attributed_to_source_injections():
+    result = ExperimentRunner().run(_dependency_scenario())
+    by_request = {c.request_id: c for c in result.comparisons}
+    # 超时请求的最终影响可追溯到 lat（延迟贡献）与 tmo（超时判定）两次注入
+    assert by_request[2].attributed_to == ["lat", "tmo"]
+    assert by_request[2].failed_node == "billing"
+    # 纯延迟场景只归因于延迟注入
+    simple = Scenario(
+        name="s", seed=3,
+        requests=[RequestSpec(at_ms=50)],
+        injections=[InjectionSpec("only-lat", "latency", "auth", 10, 100,
+                                  {"delay_ms": 20})],
+    )
+    comp = ExperimentRunner().run(simple).comparisons[0]
+    assert comp.attributed_to == ["only-lat"]
+    assert comp.latency_delta_ns == 20_000_000
+
+
+def test_early_stop_skips_later_requests_and_recovers():
+    scenario = Scenario(
+        name="stop", seed=5,
+        requests=[RequestSpec(at_ms=t) for t in (50, 150, 250, 350, 450)],
+        injections=[InjectionSpec("brk", "interruption", "auth", 100, None)],
+        stop_when=[{"kind": "consecutive_failures", "count": 2}],
+    )
+    result = ExperimentRunner().run(scenario)
+    assert result.stopped is True
+    assert result.stopped_at_ms == 250
+    assert "consecutive_failures" in result.stop_reason
+    # 停止时撤销仍生效的中断注入
+    assert {r["id"] for r in result.recovered} == {"brk"}
+    by_request = {c.request_id: c for c in result.comparisons}
+    assert by_request[1].fault_status == "interrupted"
+    assert by_request[2].fault_status == "interrupted"
+    # 停止后的请求不再执行，与对照组对比为 not_executed
+    assert by_request[3].fault_status == "not_executed"
+    assert by_request[4].fault_status == "not_executed"
+    kinds = [e["kind"] for e in result.event_log]
+    assert "stop" in kinds
+    assert kinds.count("request_skipped") == 2
+
+
+def test_cancel_same_tick_as_request_runs_clean():
+    # 一致规则：取消与请求同刻时先撤销故障，请求按无故障完成
+    scenario = Scenario(
+        name="same-tick", seed=11,
+        requests=[RequestSpec(at_ms=100), RequestSpec(at_ms=200)],
+        injections=[InjectionSpec("lat", "latency", "billing", 0, None,
+                                  {"delay_ms": 40})],
+        cancel_at_ms=200,
+    )
+    result = ExperimentRunner().run(scenario)
+    assert result.cancelled is True
+    by_request = {c.request_id: c for c in result.comparisons}
+    assert by_request[0].latency_delta_ns == 40_000_000
+    assert by_request[1].latency_delta_ns == 0
+    assert by_request[1].status_changed is False
+
+
+def test_event_log_replay_is_deterministic(tmp_path: Path):
+    scenario = _dependency_scenario()
+    runner = ExperimentRunner()
+    first = runner.run(scenario).to_dict()
+    second = runner.run(scenario).to_dict()
+    assert first["event_log"] == second["event_log"]
+    assert [e["kind"] for e in first["event_log"]] == [
+        "request", "inject_start", "request", "inject_start",
+        "request", "inject_end", "inject_end", "request",
+    ]
+    report = tmp_path / "dep.json"
+    save_run(runner.run(scenario), scenario, report)
+    assert cli_main(["replay", str(report)]) == 0
+    # 篡改事件日志后重放必须失败
+    saved = load_run(report)
+    saved["result"]["event_log"][1]["at_ms"] += 1
+    report.write_text(__import__("json").dumps(saved, ensure_ascii=False),
+                      encoding="utf-8")
+    assert cli_main(["replay", str(report)]) == 1
+
+
+def test_pending_injection_skipped_when_window_elapses():
+    scenario = Scenario(
+        name="skip", seed=2,
+        requests=[RequestSpec(at_ms=10)],
+        injections=[
+            InjectionSpec("tmo", "timeout", "billing", 100, 200,
+                          {"threshold_ms": 10},
+                          start_when={"kind": "failures_at_least", "count": 5}),
+        ],
+    )
+    result = ExperimentRunner().run(scenario)
+    kinds = [e["kind"] for e in result.event_log]
+    assert "inject_skipped" in kinds
+    assert "inject_start" not in kinds
+    assert all(not c.status_changed for c in result.comparisons)

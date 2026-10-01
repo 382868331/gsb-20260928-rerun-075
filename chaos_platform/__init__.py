@@ -6,6 +6,7 @@ from .faults import (
     FaultType,
     LatencyFault,
     InterruptionFault,
+    TimeoutFault,
     FaultManager,
     fault_registry,
 )
@@ -20,6 +21,7 @@ __all__ = [
     "FaultType",
     "LatencyFault",
     "InterruptionFault",
+    "TimeoutFault",
     "FaultManager",
     "fault_registry",
     "ExperimentRunner",

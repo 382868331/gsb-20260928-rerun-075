@@ -1,0 +1,37 @@
+{
+  "name": "次轮-自适应逐步干预",
+  "description": "背景故障使 billing 延迟越限，策略按观察窗口逐步升级干预；预算与风险上限触发后停止创建新干预。",
+  "seed": 20261002,
+  "cancel_at_ms": null,
+  "requests": [
+    {"at_ms": 0, "payload": {"i": 0}},
+    {"at_ms": 50, "payload": {"i": 1}},
+    {"at_ms": 100, "payload": {"i": 2}},
+    {"at_ms": 150, "payload": {"i": 3}},
+    {"at_ms": 200, "payload": {"i": 4}},
+    {"at_ms": 250, "payload": {"i": 5}},
+    {"at_ms": 300, "payload": {"i": 6}},
+    {"at_ms": 350, "payload": {"i": 7}},
+    {"at_ms": 400, "payload": {"i": 8}},
+    {"at_ms": 450, "payload": {"i": 9}},
+    {"at_ms": 500, "payload": {"i": 10}},
+    {"at_ms": 550, "payload": {"i": 11}}
+  ],
+  "injections": [
+    {"id": "bg-latency", "type": "latency", "target": "billing",
+     "start_ms": 0, "end_ms": 600, "params": {"delay_ms": 40}}
+  ],
+  "policy": {
+    "window_ms": 120,
+    "min_samples": 2,
+    "observation_delay_ms": 0,
+    "thresholds": {"failure_rate": 0.5, "latency_delta_ms": 30},
+    "ladder": [
+      {"type_name": "latency", "target": "auth", "duration_ms": 150,
+       "params": {"delay_ms": 20}},
+      {"type_name": "interruption", "target": "billing", "duration_ms": 100},
+      {"type_name": "interruption", "target": "inventory", "duration_ms": 100}
+    ],
+    "budget": {"max_interventions": 2, "max_failed_requests": 4}
+  }
+}

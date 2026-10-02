@@ -24,10 +24,39 @@
 - `chaos_platform/service_chain.py`：虚拟服务链与请求结果。
 - `chaos_platform/faults.py`：故障协议、注册表、内置类型、重叠/撤销管理。
 - `chaos_platform/scenario.py`：场景模型与 JSON 读写、校验。
-- `chaos_platform/runner.py`：时间线、取消恢复、双组对照与观察记录。
-- `chaos_platform/report.py` / `cli.py`：报告保存、重放校验、命令行。
-- `examples/`：首轮延迟+中断场景与取消恢复场景。
-- `tests/test_platform.py`：重叠撤销、取消恢复、对照比较、重放、扩展类型用例。
+ - `chaos_platform/runner.py`：时间线、取消恢复、双组对照与观察记录。
+ - `chaos_platform/adaptive.py`：观察驱动的逐步干预、预算/风险上限、复演与阈值分支。
+ - `chaos_platform/report.py` / `cli.py`：报告保存、重放校验、命令行。
+ - `examples/`：首轮场景与次轮自适应场景。
+ - `tests/`：首轮平台用例与自适应演练用例。
+
+## 次轮：自适应逐步干预
+
+首轮的注入在时间线上预先固定；次轮（`chaos_platform/adaptive.py`）不预先排定
+整段注入，而是在每个观察到达时按当时已到达的观察与当时生效的阈值决定是否
+升级下一阶段干预：
+
+- **决策快照不可改写**：每次决策记录决策时刻、窗口内观察、采用的阈值、指标与
+  所选动作（`escalate/hold/undetermined/stop`）。`observation_delay_ms` 模拟
+  迟到结果，迟到数据只影响其到达之后的决策，不会倒过来改写先前记录。
+- **对照过程**：不干预的对照组与干预组使用相同输入与种子并行记录，恢复来自
+  调整还是系统自身变化可逐请求对比。
+- **预算与风险上限**：`budget.max_interventions` / `max_failed_requests` 触发
+  后不再创建新干预；仍在生效的效果按各自 `duration_ms` 结束，在途请求照常
+  完成，未显式结束的由收尾统一撤销。
+- **重叠窗口去重**：窗口内已推动过升级的失败/越限会被消费，同一失败不会重复
+  推动升级；样本不足 `min_samples` 时决策标为 `undetermined`。
+- **复演与分支**：`adaptive replay` 按保存的场景与策略逐步复演原决策并逐字段
+  比对；`adaptive branch --set 阈值=新值` 建立独立分支（原报告不被修改），
+  `adaptive explain` 将首次分歧归因于阈值变化，后续分歧标记为上游分歧的下游
+  影响。
+
+```bash
+.venv/bin/python -m chaos_platform adaptive run examples/adaptive_demo.json -o /tmp/ad.json
+.venv/bin/python -m chaos_platform adaptive replay /tmp/ad.json
+.venv/bin/python -m chaos_platform adaptive branch /tmp/ad.json --set latency_delta_ms=1000 -o /tmp/ad_branch.json
+.venv/bin/python -m chaos_platform adaptive explain /tmp/ad.json /tmp/ad_branch.json
+```
 
 ## 使用
 

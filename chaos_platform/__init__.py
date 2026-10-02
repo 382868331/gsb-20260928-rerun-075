@@ -1,5 +1,19 @@
 """系统故障演练平台：场景编排、故障注入、观察记录与对照回放。"""
 
+from .adaptive import (
+    AdaptivePolicy,
+    AdaptiveResult,
+    AdaptiveRunner,
+    Budget,
+    Decision,
+    LadderRung,
+    Thresholds,
+    explain_branch,
+    replay_adaptive,
+    run_branch,
+    save_adaptive_run,
+    load_adaptive_run,
+)
 from .clock import VirtualClock
 from .faults import (
     EffectHandle,
@@ -15,6 +29,18 @@ from .scenario import InjectionSpec, RequestSpec, Scenario, load_scenario, save_
 from .service_chain import ServiceChain, ServiceNode
 
 __all__ = [
+    "AdaptivePolicy",
+    "AdaptiveResult",
+    "AdaptiveRunner",
+    "Budget",
+    "Decision",
+    "LadderRung",
+    "Thresholds",
+    "explain_branch",
+    "replay_adaptive",
+    "run_branch",
+    "save_adaptive_run",
+    "load_adaptive_run",
     "VirtualClock",
     "EffectHandle",
     "FaultType",

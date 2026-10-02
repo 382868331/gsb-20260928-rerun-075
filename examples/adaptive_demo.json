@@ -1,0 +1,41 @@
+{
+  "name": "自适应干预演示",
+  "description": "每个决策点只使用当时已到达的观察，预算停止后不再创建新干预。",
+  "seed": 20261002,
+  "cancel_at_ms": null,
+  "adaptive_policy": {
+    "decision_at_ms": [120, 220, 320, 420],
+    "limits": {
+      "max_interventions": 2,
+      "max_cost": 3,
+      "max_risk": 2
+    },
+    "actions": {
+      "degraded": {
+        "type": "latency",
+        "target": "billing",
+        "duration_ms": 80,
+        "params": {"delay_ms": 20},
+        "cost": 1,
+        "risk": 0
+      },
+      "failed": {
+        "type": "interruption",
+        "target": "inventory",
+        "duration_ms": 80,
+        "params": {},
+        "cost": 2,
+        "risk": 1
+      }
+    }
+  },
+  "requests": [
+    {"at_ms": 40, "payload": {"user": "alice"}},
+    {"at_ms": 100, "payload": {"user": "bob"}},
+    {"at_ms": 180, "payload": {"user": "carol"}},
+    {"at_ms": 260, "payload": {"user": "dave"}},
+    {"at_ms": 340, "payload": {"user": "erin"}},
+    {"at_ms": 420, "payload": {"user": "frank"}}
+  ],
+  "injections": []
+}

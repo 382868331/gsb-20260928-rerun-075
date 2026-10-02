@@ -5,7 +5,7 @@ import json
 from pathlib import Path
 
 from .faults import fault_registry
-from .report import load_run, save_run
+from .report import load_run, save_adaptive_run, save_run
 from .runner import ExperimentRunner
 from .scenario import scenario_from_dict, load_scenario
 
@@ -26,6 +26,24 @@ def _print_summary(result_dict: dict) -> None:
               f"{comp['control_status']} -> {note}")
 
 
+def _load_json(path: Path) -> dict:
+    return json.loads(path.read_text(encoding="utf-8"))
+
+
+def _print_adaptive_summary(result: dict) -> None:
+    print(f"自适应场景: {result['scenario_name']}  种子: {result['seed']}")
+    for branch in result["branches"]:
+        selected = [d for d in branch["decisions"]
+                    if d.get("action") and d["action"].get("selected")]
+        print(f"分支 {branch['branch_id']}: 决策 {len(branch['decisions'])} 次，"
+              f"选择干预 {len(selected)} 次，停止: {branch['stopped']}"
+              + (f"（{branch['stop_reason']}）" if branch['stop_reason'] else ""))
+        for decision in selected:
+            action = decision["action"]["spec"]
+            print(f"  @{decision['at_ms']}ms {decision['severity']}: "
+                  f"{action['id']} -> {action['target']} {action['type']}")
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(prog="chaos", description="系统故障演练平台")
     sub = parser.add_subparsers(dest="command", required=True)
@@ -33,6 +51,12 @@ def main(argv: list[str] | None = None) -> int:
     run_p = sub.add_parser("run", help="运行场景（对照组 + 故障组）")
     run_p.add_argument("scenario", type=Path)
     run_p.add_argument("-o", "--output", type=Path, help="保存完整报告的 JSON 路径")
+
+    adaptive_p = sub.add_parser("adaptive-run", help="按观察结果逐步选择干预")
+    adaptive_p.add_argument("scenario", type=Path)
+    adaptive_p.add_argument("--thresholds", required=True, type=Path)
+    adaptive_p.add_argument("--alternate-thresholds", type=Path)
+    adaptive_p.add_argument("-o", "--output", type=Path)
 
     replay_p = sub.add_parser("replay", help="用已保存报告中的种子与输入重放并比对")
     replay_p.add_argument("report", type=Path)
@@ -54,9 +78,39 @@ def main(argv: list[str] | None = None) -> int:
         _print_summary({"result": result.to_dict()})
         return 0
 
+    if args.command == "adaptive-run":
+        scenario = load_scenario(args.scenario)
+        thresholds = _load_json(args.thresholds)
+        alternate = (_load_json(args.alternate_thresholds)
+                     if args.alternate_thresholds else None)
+        result = ExperimentRunner().run_adaptive_experiment(
+            scenario, thresholds, alternate)
+        if args.output:
+            save_adaptive_run(result, scenario, args.output)
+            print(f"自适应报告已保存: {args.output}")
+        _print_adaptive_summary(result)
+        return 0
+
     if args.command == "replay":
         saved = load_run(args.report)
         scenario = scenario_from_dict(saved["scenario"])
+        if saved.get("schema") == "adaptive_run_v1":
+            runner = ExperimentRunner()
+            current = {
+                "scenario_name": scenario.name,
+                "seed": scenario.seed,
+                "branches": [
+                    runner.run_adaptive_branch(scenario, branch["thresholds"],
+                                               branch["branch_id"])
+                    for branch in saved["result"]["branches"]
+                ],
+            }
+            if current != saved["result"]:
+                print("自适应重放结果与保存报告不一致")
+                return 1
+            print("自适应重放结果与保存报告完全一致")
+            _print_adaptive_summary(saved["result"])
+            return 0
         result = ExperimentRunner().run(scenario).to_dict()
         if result != saved["result"]:
             print("重放结果与保存报告不一致")

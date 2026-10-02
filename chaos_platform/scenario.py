@@ -28,6 +28,7 @@ class Scenario:
     injections: list[InjectionSpec] = field(default_factory=list)
     cancel_at_ms: int | None = None
     description: str = ""
+    adaptive_policy: dict = field(default_factory=dict)
 
     def to_dict(self) -> dict:
         return {
@@ -35,6 +36,7 @@ class Scenario:
             "description": self.description,
             "seed": self.seed,
             "cancel_at_ms": self.cancel_at_ms,
+            "adaptive_policy": self.adaptive_policy,
             "requests": [asdict(r) for r in self.requests],
             "injections": [
                 {
@@ -72,6 +74,7 @@ def scenario_from_dict(data: dict) -> Scenario:
         seed=int(data["seed"]),
         cancel_at_ms=(None if data.get("cancel_at_ms") is None
                       else int(data["cancel_at_ms"])),
+        adaptive_policy=data.get("adaptive_policy", {}),
         requests=requests,
         injections=injections,
     )
@@ -90,6 +93,17 @@ def validate_scenario(scenario: Scenario) -> None:
     request_times = [r.at_ms for r in scenario.requests]
     if request_times != sorted(request_times):
         raise ValueError("请求序列必须按 at_ms 升序排列")
+    policy = scenario.adaptive_policy
+    if policy:
+        if not policy.get("decision_at_ms"):
+            raise ValueError("adaptive_policy.decision_at_ms 不能为空")
+        decision_times = [int(t) for t in policy["decision_at_ms"]]
+        if decision_times != sorted(decision_times):
+            raise ValueError("决策点必须按时间升序排列")
+        limits = policy.get("limits", {})
+        for name in ("max_interventions", "max_cost", "max_risk"):
+            if name in limits and limits[name] < 0:
+                raise ValueError(f"{name} 不能为负数")
 
 
 def save_scenario(scenario: Scenario, path: str | Path) -> Path:

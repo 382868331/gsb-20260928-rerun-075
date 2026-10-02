@@ -6,6 +6,7 @@ from .clock import VirtualClock
 from .faults import FaultManager, fault_registry
 from .scenario import Scenario
 from .service_chain import CallResult, ServiceChain
+from .adaptive import AdaptiveEngine
 
 
 @dataclass
@@ -89,6 +90,7 @@ class ExperimentRunner:
                  manager_factory=lambda: FaultManager(fault_registry)) -> None:
         self.chain = chain or ServiceChain()
         self.manager_factory = manager_factory
+        self.adaptive_engine = AdaptiveEngine(self.chain, manager_factory)
 
     def _build_timeline(self, scenario: Scenario, config: RunConfig,
                         include_faults: bool) -> list[_TimelineEvent]:
@@ -183,6 +185,38 @@ class ExperimentRunner:
             comparisons=comparisons,
             fault_events=fault_events,
         )
+
+    def run_adaptive_branch(
+        self,
+        scenario: Scenario,
+        thresholds: dict,
+        branch_id: str = "root",
+        config: RunConfig | None = None,
+    ) -> dict:
+        config = config or RunConfig()
+        return self.adaptive_engine.run_branch(
+            scenario=scenario,
+            thresholds=thresholds,
+            branch_id=branch_id,
+            horizon_ms=config.horizon_ms,
+        )
+
+    def run_adaptive_experiment(
+        self,
+        scenario: Scenario,
+        root_thresholds: dict,
+        alternate_thresholds: dict | None = None,
+        config: RunConfig | None = None,
+    ) -> dict:
+        branches = [self.run_adaptive_branch(scenario, root_thresholds, "root", config)]
+        if alternate_thresholds is not None:
+            branches.append(self.run_adaptive_branch(
+                scenario, alternate_thresholds, "alternate", config))
+        return {
+            "scenario_name": scenario.name,
+            "seed": scenario.seed,
+            "branches": branches,
+        }
 
     @staticmethod
     def _compare(control: list[Observation], fault: list[Observation]) -> list[Comparison]:

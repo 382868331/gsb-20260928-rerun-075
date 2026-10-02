@@ -10,7 +10,9 @@ from .faults import (
     fault_registry,
 )
 from .report import load_run, save_run
+from .report import save_adaptive_run
 from .runner import ExperimentRunner, RunConfig, RunResult
+from .adaptive import AdaptiveEngine, AdaptiveObservation
 from .scenario import InjectionSpec, RequestSpec, Scenario, load_scenario, save_scenario
 from .service_chain import ServiceChain, ServiceNode
 
@@ -25,6 +27,8 @@ __all__ = [
     "ExperimentRunner",
     "RunConfig",
     "RunResult",
+    "AdaptiveEngine",
+    "AdaptiveObservation",
     "Scenario",
     "InjectionSpec",
     "RequestSpec",
@@ -33,5 +37,6 @@ __all__ = [
     "ServiceChain",
     "ServiceNode",
     "save_run",
+    "save_adaptive_run",
     "load_run",
 ]

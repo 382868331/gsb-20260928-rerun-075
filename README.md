@@ -27,6 +27,19 @@
   样本数低于 `min_observations` 时持续标记为 `undetermined`。
 - **独立阈值分支**：可用另一套阈值重跑相同输入和对照组，治疗观察、动作和解释独立保存，
   不覆盖原分支；解释区分干预、系统变化和自然失败。
+- **干预审批流**：`adaptive_policy.approval.required=true` 时，决策只产生
+  `pending_confirmation` 建议，不扣预算、不注入故障；操作者在
+  `approval.decisions` 中以 `confirm / abandon / withdraw` 表态。确认时重新检查当时的
+  风险余额、观察范围与仍在生效的干预，已触发的停止条件与过期建议
+  （`expires_after_ms`）都不能再生效；预算在确认成功时才扣除。同一
+  `(作用维度, 目标)` 的争用在 `overlap: wait` 下必须等前一项结束（`scope_contention`，
+  建议保持待确认、可再次确认），`overlap: stack` 则允许叠加；重检结果写入
+  `approvals[].recheck`（含 `conflicting_intervention_ids` / `can_coexist`）。
+  放弃未生效建议不改变历史观察；撤回已生效干预按原有收尾约定立即 `inject_end`，
+  并记录 `affected_observation_ids` 与 `post_withdrawal_observation_ids`。
+  迟到观察只进入确认时的 recheck 与后续新建议，不改写建议的 `basis` 快照；
+  未获批准的建议不会出现在 `fault_events` 中，每个阶段都能从
+  `suggestions[]` → `approvals[]` → `fault_events` → `observations` 追溯。
 
 ## 目录结构
 
@@ -49,6 +62,8 @@
   --thresholds examples/adaptive_thresholds_root.json \
   --alternate-thresholds examples/adaptive_thresholds_alt.json \
   -o /tmp/adaptive.json
+.venv/bin/python -m chaos_platform adaptive-run examples/adaptive_approval.json \
+  --thresholds examples/adaptive_thresholds_root.json -o /tmp/approval.json
 .venv/bin/python -m chaos_platform replay /tmp/adaptive.json
 .venv/bin/python -m pytest -q
 ```

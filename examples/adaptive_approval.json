@@ -1,0 +1,61 @@
+{
+  "name": "自适应审批演示",
+  "description": "干预建议需人工确认才生效；确认时重检预算、观察范围与在途干预。",
+  "seed": 20261003,
+  "cancel_at_ms": null,
+  "adaptive_policy": {
+    "decision_at_ms": [120, 220, 320, 420],
+    "limits": {
+      "max_interventions": 2,
+      "max_cost": 3,
+      "max_risk": 2
+    },
+    "approval": {
+      "required": true,
+      "expires_after_ms": 150,
+      "overlap": "wait",
+      "decisions": [
+        {"at_ms": 160, "suggestion": "root:d0:degraded", "choice": "confirm"},
+        {"at_ms": 230, "suggestion": "root:d1:degraded", "choice": "confirm"},
+        {"at_ms": 300, "suggestion": "root:d1:degraded", "choice": "confirm"},
+        {"at_ms": 360, "suggestion": "root:d1:degraded", "choice": "withdraw"}
+      ]
+    },
+    "actions": {
+      "degraded": {
+        "type": "latency",
+        "target": "billing",
+        "duration_ms": 80,
+        "params": {"delay_ms": 20},
+        "cost": 1,
+        "risk": 0
+      },
+      "failed": {
+        "type": "interruption",
+        "target": "inventory",
+        "duration_ms": 120,
+        "params": {},
+        "cost": 2,
+        "risk": 1
+      }
+    }
+  },
+  "requests": [
+    {"at_ms": 40, "payload": {"user": "alice"}},
+    {"at_ms": 100, "payload": {"user": "bob"}},
+    {"at_ms": 180, "payload": {"user": "carol"}},
+    {"at_ms": 260, "payload": {"user": "dave"}},
+    {"at_ms": 340, "payload": {"user": "erin"}},
+    {"at_ms": 420, "payload": {"user": "frank"}}
+  ],
+  "injections": [
+    {
+      "id": "billing-outage",
+      "type": "interruption",
+      "target": "billing",
+      "start_ms": 90,
+      "end_ms": 200,
+      "params": {}
+    }
+  ]
+}

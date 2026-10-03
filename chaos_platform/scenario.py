@@ -104,6 +104,20 @@ def validate_scenario(scenario: Scenario) -> None:
         for name in ("max_interventions", "max_cost", "max_risk"):
             if name in limits and limits[name] < 0:
                 raise ValueError(f"{name} 不能为负数")
+        approval = policy.get("approval", {})
+        if approval:
+            if approval.get("overlap", "wait") not in ("wait", "stack"):
+                raise ValueError("approval.overlap 只能是 wait 或 stack")
+            expires = approval.get("expires_after_ms")
+            if expires is not None and expires < 0:
+                raise ValueError("approval.expires_after_ms 不能为负数")
+            for entry in approval.get("decisions", []):
+                if "at_ms" not in entry or "suggestion" not in entry:
+                    raise ValueError("approval.decisions 需要 at_ms 与 suggestion")
+                if entry.get("choice") not in ("confirm", "abandon", "withdraw"):
+                    raise ValueError(
+                        "approval.decisions.choice 只能是 "
+                        "confirm / abandon / withdraw")
 
 
 def save_scenario(scenario: Scenario, path: str | Path) -> Path:

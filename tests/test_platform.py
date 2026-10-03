@@ -297,3 +297,189 @@ def test_alternate_threshold_branch_is_independent_and_replays(tmp_path: Path):
     replayed = ExperimentRunner(SlowChain()).run_adaptive_experiment(
         scenario, root_thresholds, alt_thresholds)
     assert replayed == experiment
+
+
+class _FailingChain:
+    def __init__(self, failing):
+        self.failing = set(failing)
+
+    def call(self, request_id, payload, seed, manager):
+        if request_id in self.failing:
+            return CallResult(request_id, payload, "interrupted", 20_000_000,
+                              failed_node="inventory",
+                              error="stub inventory failure")
+        return CallResult(request_id, payload, "ok", 20_000_000)
+
+
+_APPROVAL_THRESHOLDS = {"window_ms": 45, "min_observations": 1,
+                        "failure_rate": 1.0, "avg_latency_ms": 100000}
+
+
+def _approval_scenario(request_times, approvals, expires_after_ms=200,
+                       overlap="wait", max_risk=10, duration_ms=100):
+    policy = {
+        "decision_at_ms": [150, 250],
+        "limits": {"max_interventions": 5, "max_cost": 10,
+                   "max_risk": max_risk},
+        "approval": {
+            "required": True,
+            "expires_after_ms": expires_after_ms,
+            "overlap": overlap,
+            "decisions": approvals,
+        },
+        "actions": {
+            "failed": {
+                "type": "interruption",
+                "target": "inventory",
+                "duration_ms": duration_ms,
+                "params": {},
+                "cost": 1,
+                "risk": 1,
+            }
+        },
+    }
+    return Scenario(
+        name="approval", seed=7,
+        requests=[RequestSpec(t, {"n": i}) for i, t in enumerate(request_times)],
+        adaptive_policy=policy,
+    )
+
+
+def _suggestion(branch, suggestion_id):
+    return next(s for s in branch["suggestions"] if s["id"] == suggestion_id)
+
+
+def test_approval_never_confirmed_suggestion_expires_without_injection():
+    scenario = _approval_scenario([80, 130, 400], approvals=[],
+                                  expires_after_ms=100)
+    branch = ExperimentRunner(_FailingChain({1})).run_adaptive_branch(
+        scenario, _APPROVAL_THRESHOLDS)
+
+    suggestion = _suggestion(branch, "root:d0:failed")
+    # 操作者迟迟未确认：过期后建议作废，且从不算作故障注入。
+    assert suggestion["status"] == "expired"
+    assert suggestion["expires_at_ms"] == 250
+    assert branch["fault_events"] == []
+    assert branch["approvals"] == []
+    # 治疗组观察与对照组完全一致，对照组独立保留。
+    assert all(not c["status_changed"] and c["latency_delta_ns"] == 0
+               for c in branch["comparisons"])
+    assert [o["result"] for o in branch["observations"]] == \
+        [o["result"] for o in branch["control_observations"]]
+
+
+def test_approval_risk_limit_then_stop_condition_blocks_confirmation():
+    approvals = [
+        {"at_ms": 300, "suggestion": "root:d0:failed", "choice": "confirm"},
+        {"at_ms": 310, "suggestion": "root:d1:failed", "choice": "confirm"},
+        {"at_ms": 320, "suggestion": "root:d1:failed", "choice": "confirm"},
+    ]
+    scenario = _approval_scenario([80, 130, 230], approvals=approvals,
+                                  expires_after_ms=500, max_risk=1)
+    branch = ExperimentRunner(_FailingChain({1, 2})).run_adaptive_branch(
+        scenario, _APPROVAL_THRESHOLDS)
+
+    outcomes = [(a["choice"], a["outcome"], a["reason"])
+                for a in branch["approvals"]]
+    assert outcomes == [
+        ("confirm", "confirmed", None),
+        # 风险上限在确认时重检：1 + 1 > max_risk=1，触发停止。
+        ("confirm", "rejected", "risk_limit_reached"),
+        # 已触发的停止条件不能被后续确认绕过。
+        ("confirm", "rejected", "stop_condition_active"),
+    ]
+    assert branch["stopped"] is True
+    assert branch["stop_reason"] == "risk_limit_reached"
+    assert _suggestion(branch, "root:d0:failed")["status"] == "completed"
+    assert _suggestion(branch, "root:d1:failed")["status"] == "unconfirmed"
+    # 只有 d0 真正生效过。
+    assert {e["id"] for e in branch["fault_events"]} == {"root:d0:failed"}
+
+
+def test_approval_contention_wait_then_reopen_and_withdraw():
+    approvals = [
+        {"at_ms": 160, "suggestion": "root:d0:failed", "choice": "confirm"},
+        {"at_ms": 255, "suggestion": "root:d1:failed", "choice": "confirm"},
+        {"at_ms": 265, "suggestion": "root:d1:failed", "choice": "confirm"},
+        {"at_ms": 300, "suggestion": "root:d1:failed", "choice": "withdraw"},
+    ]
+    scenario = _approval_scenario([80, 130, 230, 280, 350],
+                                  approvals=approvals)
+    branch = ExperimentRunner(_FailingChain({1, 2})).run_adaptive_branch(
+        scenario, _APPROVAL_THRESHOLDS)
+
+    outcomes = [(a["at_ms"], a["outcome"], a["reason"])
+                for a in branch["approvals"]]
+    assert outcomes == [
+        (160, "confirmed", None),
+        # d0 生效到 260，d1 争用同一 (interruption, inventory)，必须等待。
+        (255, "rejected", "scope_contention"),
+        # 前一项收尾结束后重开成功。
+        (265, "confirmed", None),
+        (300, "withdrawn", None),
+    ]
+    contention = branch["approvals"][1]["recheck"]
+    assert contention["can_coexist"] is False
+    assert contention["conflicting_intervention_ids"] == ["root:d0:failed"]
+    assert contention["active_intervention_ids"] == ["root:d0:failed"]
+
+    events = [(e["event"], e["id"], e["at_ms"])
+              for e in branch["fault_events"]]
+    assert events == [
+        ("inject_start", "root:d0:failed", 160),
+        ("inject_end", "root:d0:failed", 260),
+        ("inject_start", "root:d1:failed", 265),
+        # 撤回按原有收尾约定立即撤销。
+        ("inject_end", "root:d1:failed", 300),
+    ]
+
+    d0 = _suggestion(branch, "root:d0:failed")
+    d1 = _suggestion(branch, "root:d1:failed")
+    assert d0["status"] == "completed"
+    assert d0["confirmed_at_ms"] == 160
+    assert d0["affected_observation_ids"] == [2]
+    assert d1["status"] == "withdrawn"
+    assert d1["withdrawn_at_ms"] == 300
+    assert d1["effective_spec"]["start_ms"] == 265
+    # 请求 3 在 d1 生效期间到达；撤回后的到达结果被逐条记录。
+    assert d1["affected_observation_ids"] == [3]
+    assert d1["post_withdrawal_observation_ids"] == [3, 4]
+
+
+def test_approval_abandon_and_late_observation_does_not_rewrite_basis():
+    # 请求 2 调度于 145，165 才到达：建议于 150 生成时它尚未到达。
+    scenario = _approval_scenario(
+        [80, 130, 145, 380],
+        approvals=[{"at_ms": 170, "suggestion": "root:d0:failed",
+                    "choice": "abandon"}])
+    branch = ExperimentRunner(_FailingChain({1, 2})).run_adaptive_branch(
+        scenario, _APPROVAL_THRESHOLDS)
+
+    suggestion = _suggestion(branch, "root:d0:failed")
+    assert suggestion["status"] == "abandoned"
+    # 放弃未生效建议不改变历史观察，也未产生任何注入。
+    assert branch["fault_events"] == []
+    assert len(branch["observations"]) == 4
+    # 迟到观察不能改写原确认依据。
+    assert suggestion["basis"]["arrived_observation_ids"] == [0, 1]
+    assert branch["approvals"][0]["outcome"] == "abandoned"
+
+    # 换成确认：迟到观察只出现在确认时的重检里，依据快照保持原样。
+    scenario = _approval_scenario(
+        [80, 130, 145, 380],
+        approvals=[{"at_ms": 170, "suggestion": "root:d0:failed",
+                    "choice": "confirm"}])
+    branch = ExperimentRunner(_FailingChain({1, 2})).run_adaptive_branch(
+        scenario, _APPROVAL_THRESHOLDS)
+    suggestion = _suggestion(branch, "root:d0:failed")
+    approval = branch["approvals"][0]
+    assert approval["outcome"] == "confirmed"
+    assert approval["recheck"]["arrived_observation_ids"] == [0, 1, 2]
+    assert approval["recheck"]["basis_intact"] is True
+    assert suggestion["basis"]["arrived_observation_ids"] == [0, 1]
+    assert suggestion["status"] == "completed"
+
+    # 确定性：相同输入重跑结果一致。
+    again = ExperimentRunner(_FailingChain({1, 2})).run_adaptive_branch(
+        scenario, _APPROVAL_THRESHOLDS)
+    assert again == branch

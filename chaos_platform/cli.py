@@ -38,10 +38,25 @@ def _print_adaptive_summary(result: dict) -> None:
         print(f"分支 {branch['branch_id']}: 决策 {len(branch['decisions'])} 次，"
               f"选择干预 {len(selected)} 次，停止: {branch['stopped']}"
               + (f"（{branch['stop_reason']}）" if branch['stop_reason'] else ""))
+        suggestions = branch.get("suggestions") or []
+        if suggestions:
+            by_status: dict[str, int] = {}
+            for suggestion in suggestions:
+                by_status[suggestion["status"]] = \
+                    by_status.get(suggestion["status"], 0) + 1
+            print("  建议状态: " + ", ".join(
+                f"{status}={count}" for status, count in sorted(by_status.items())))
+            for approval in branch.get("approvals", []):
+                note = approval["outcome"] + (
+                    f"（{approval['reason']}）" if approval.get("reason") else "")
+                print(f"  审批 @{approval['at_ms']}ms "
+                      f"{approval['suggestion_id']} {approval['choice']}: {note}")
         for decision in selected:
             action = decision["action"]["spec"]
+            suffix = ("（待确认）" if decision["action"].get("requires_confirmation")
+                      else "")
             print(f"  @{decision['at_ms']}ms {decision['severity']}: "
-                  f"{action['id']} -> {action['target']} {action['type']}")
+                  f"{action['id']} -> {action['target']} {action['type']}{suffix}")
 
 
 def main(argv: list[str] | None = None) -> int:

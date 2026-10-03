@@ -1,0 +1,6 @@
+{
+  "window_ms": 60,
+  "min_observations": 1,
+  "failure_rate": 1.0,
+  "avg_latency_ms": 10
+}

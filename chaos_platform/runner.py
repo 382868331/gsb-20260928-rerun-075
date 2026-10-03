@@ -192,6 +192,7 @@ class ExperimentRunner:
         thresholds: dict,
         branch_id: str = "root",
         config: RunConfig | None = None,
+        approvals: list[dict] | None = None,
     ) -> dict:
         config = config or RunConfig()
         return self.adaptive_engine.run_branch(
@@ -199,6 +200,7 @@ class ExperimentRunner:
             thresholds=thresholds,
             branch_id=branch_id,
             horizon_ms=config.horizon_ms,
+            approvals=approvals,
         )
 
     def run_adaptive_experiment(
@@ -207,11 +209,15 @@ class ExperimentRunner:
         root_thresholds: dict,
         alternate_thresholds: dict | None = None,
         config: RunConfig | None = None,
+        approvals: list[dict] | None = None,
+        alternate_approvals: list[dict] | None = None,
     ) -> dict:
-        branches = [self.run_adaptive_branch(scenario, root_thresholds, "root", config)]
+        branches = [self.run_adaptive_branch(scenario, root_thresholds, "root",
+                                             config, approvals)]
         if alternate_thresholds is not None:
             branches.append(self.run_adaptive_branch(
-                scenario, alternate_thresholds, "alternate", config))
+                scenario, alternate_thresholds, "alternate", config,
+                alternate_approvals))
         return {
             "scenario_name": scenario.name,
             "seed": scenario.seed,

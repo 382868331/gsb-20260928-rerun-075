@@ -1,0 +1,34 @@
+{
+  "name": "自适应审批演示",
+  "description": "干预建议需人工确认后才生效；确认时重新检查风险余额与范围争用。",
+  "seed": 20261003,
+  "cancel_at_ms": null,
+  "adaptive_policy": {
+    "decision_at_ms": [100, 110],
+    "limits": {"max_interventions": 3, "max_cost": 5, "max_risk": 2},
+    "approval": {"required": true, "expires_after_ms": 200, "allow_overlap": false},
+    "actions": {
+      "degraded": {
+        "type": "latency",
+        "target": "billing",
+        "duration_ms": 100,
+        "params": {"delay_ms": 20},
+        "cost": 1,
+        "risk": 1
+      },
+      "failed": {
+        "type": "interruption",
+        "target": "inventory",
+        "duration_ms": 100,
+        "params": {},
+        "cost": 1,
+        "risk": 1
+      }
+    }
+  },
+  "requests": [
+    {"at_ms": 50, "payload": {"user": "alice"}},
+    {"at_ms": 90, "payload": {"user": "bob"}}
+  ],
+  "injections": []
+}

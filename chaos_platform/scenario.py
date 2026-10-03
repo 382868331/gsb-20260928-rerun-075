@@ -104,6 +104,10 @@ def validate_scenario(scenario: Scenario) -> None:
         for name in ("max_interventions", "max_cost", "max_risk"):
             if name in limits and limits[name] < 0:
                 raise ValueError(f"{name} 不能为负数")
+        approval = policy.get("approval", {})
+        if (approval.get("expires_after_ms") is not None
+                and int(approval["expires_after_ms"]) < 0):
+            raise ValueError("approval.expires_after_ms 不能为负数")
 
 
 def save_scenario(scenario: Scenario, path: str | Path) -> Path:

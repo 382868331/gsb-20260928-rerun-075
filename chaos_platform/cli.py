@@ -42,6 +42,14 @@ def _print_adaptive_summary(result: dict) -> None:
             action = decision["action"]["spec"]
             print(f"  @{decision['at_ms']}ms {decision['severity']}: "
                   f"{action['id']} -> {action['target']} {action['type']}")
+        suggestions = branch.get("suggestions", [])
+        if suggestions:
+            counts: dict[str, int] = {}
+            for suggestion in suggestions:
+                counts[suggestion["status"]] = \
+                    counts.get(suggestion["status"], 0) + 1
+            detail = ", ".join(f"{k}:{v}" for k, v in sorted(counts.items()))
+            print(f"  建议 {len(suggestions)} 条（{detail}）")
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -56,6 +64,9 @@ def main(argv: list[str] | None = None) -> int:
     adaptive_p.add_argument("scenario", type=Path)
     adaptive_p.add_argument("--thresholds", required=True, type=Path)
     adaptive_p.add_argument("--alternate-thresholds", type=Path)
+    adaptive_p.add_argument("--approvals", type=Path,
+                            help="根分支人工确认/放弃/撤回事件 JSON")
+    adaptive_p.add_argument("--alternate-approvals", type=Path)
     adaptive_p.add_argument("-o", "--output", type=Path)
 
     replay_p = sub.add_parser("replay", help="用已保存报告中的种子与输入重放并比对")
@@ -83,8 +94,12 @@ def main(argv: list[str] | None = None) -> int:
         thresholds = _load_json(args.thresholds)
         alternate = (_load_json(args.alternate_thresholds)
                      if args.alternate_thresholds else None)
+        approvals = _load_json(args.approvals) if args.approvals else None
+        alt_approvals = (_load_json(args.alternate_approvals)
+                         if args.alternate_approvals else None)
         result = ExperimentRunner().run_adaptive_experiment(
-            scenario, thresholds, alternate)
+            scenario, thresholds, alternate,
+            approvals=approvals, alternate_approvals=alt_approvals)
         if args.output:
             save_adaptive_run(result, scenario, args.output)
             print(f"自适应报告已保存: {args.output}")
@@ -101,7 +116,8 @@ def main(argv: list[str] | None = None) -> int:
                 "seed": scenario.seed,
                 "branches": [
                     runner.run_adaptive_branch(scenario, branch["thresholds"],
-                                               branch["branch_id"])
+                                               branch["branch_id"],
+                                               approvals=branch.get("approvals"))
                     for branch in saved["result"]["branches"]
                 ],
             }

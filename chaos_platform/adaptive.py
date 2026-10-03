@@ -45,6 +45,7 @@ class AdaptiveEngine:
         branch_id: str = "root",
         group_name: str = "adaptive_treatment",
         horizon_ms: int | None = None,
+        approvals: list[dict] | None = None,
     ) -> dict:
         policy = scenario.adaptive_policy
         if not policy:
@@ -52,18 +53,29 @@ class AdaptiveEngine:
         decision_times = [int(t) for t in policy["decision_at_ms"]]
         horizon = horizon_ms if horizon_ms is not None else self._horizon(
             scenario, decision_times)
+        if approvals:
+            horizon = max(horizon, max(int(a["at_ms"]) for a in approvals))
 
         control = self._run_control(scenario, branch_id)
-        treatment, decisions, stopped, stop_reason, fault_events = self._run_treatment(
-            scenario, thresholds, decision_times, horizon, branch_id, group_name)
+        treatment, decisions, stopped, stop_reason, fault_events, suggestions = \
+            self._run_treatment(scenario, thresholds, decision_times, horizon,
+                                branch_id, group_name, approvals or [])
         control_by_id = {o.request_id: o for o in control}
         comparisons = [self._compare(control_by_id[o.request_id], o)
                        for o in treatment]
+        # 记录每次实际生效干预影响了哪些后续观察。
+        for suggestion in suggestions:
+            suggestion["affected_observation_ids"] = [
+                o.request_id for o in treatment
+                if suggestion["id"] in o.active_intervention_ids
+            ]
         return {
             "branch_id": branch_id,
             "parent_id": None if branch_id == "root" else "root",
             "group": group_name,
             "thresholds": dict(thresholds),
+            "approvals": [dict(a) for a in (approvals or [])],
+            "suggestions": suggestions,
             "control_observations": [o.to_dict() for o in control],
             "observations": [o.to_dict() for o in treatment],
             "comparisons": comparisons,
@@ -83,7 +95,7 @@ class AdaptiveEngine:
         return observations
 
     def _run_treatment(self, scenario, thresholds, decision_times, horizon_ms,
-                       branch_id, group_name):
+                       branch_id, group_name, approvals):
         clock = VirtualClock()
         manager = self.manager_factory()
         queue: list[tuple] = []
@@ -103,12 +115,21 @@ class AdaptiveEngine:
                 push(spec.end_ms, 1, "inject_end", {"id": spec.id})
         for idx, at_ms in enumerate(decision_times):
             push(at_ms, 1, "decision", {"index": idx})
+        for event in approvals:
+            push(int(event["at_ms"]), 1, "approval", {"event": event})
         if scenario.cancel_at_ms is not None:
             push(scenario.cancel_at_ms, 1, "cancel")
         push(horizon_ms, 2, "close")
 
+        policy = scenario.adaptive_policy
+        approval_cfg = policy.get("approval", {})
+        approval_required = bool(approval_cfg.get("required", False))
+        allow_overlap = bool(approval_cfg.get("allow_overlap", False))
+        expires_after_ms = approval_cfg.get("expires_after_ms")
+        limits = policy.get("limits", {})
         observations: list[AdaptiveObservation] = []
         decisions: list[dict] = []
+        suggestions: list[dict] = []
         escalated_failures: set[int] = set()
         spent_cost = 0.0
         spent_risk = 0.0
@@ -123,6 +144,26 @@ class AdaptiveEngine:
         scheduled_ends: list[int] = []
         active_open_effect_ids: set[str] = set()
         finish_scheduled = False
+
+        def expire_pending(now_ms):
+            for suggestion in suggestions:
+                valid_until = suggestion["valid_until_ms"]
+                if (suggestion["status"] == "pending"
+                        and valid_until is not None and valid_until < now_ms):
+                    suggestion["status"] = "expired"
+                    suggestion["expired_at_ms"] = valid_until
+
+        def find_suggestion(event):
+            suggestion_id = event.get("suggestion_id")
+            if suggestion_id is not None:
+                for suggestion in suggestions:
+                    if suggestion["id"] == suggestion_id:
+                        return suggestion
+                return None
+            decision_index = event.get("decision_index")
+            matches = [s for s in suggestions
+                       if s["decision_index"] == decision_index]
+            return matches[-1] if matches else None
 
         def schedule_finish_if_complete():
             nonlocal finish_scheduled
@@ -139,6 +180,7 @@ class AdaptiveEngine:
         while queue:
             at_ms, order, _, kind, payload = heapq.heappop(queue)
             clock.advance_to(VirtualClock.ms_to_ns(at_ms))
+            expire_pending(at_ms)
 
             if closed and kind in ("request_start", "decision"):
                 if kind == "request_start":
@@ -173,18 +215,158 @@ class AdaptiveEngine:
                     became_stopped, current_stop_reason, spec = self._decide(
                         scenario, thresholds, observations, payload["index"], at_ms,
                         horizon_ms, branch_id, escalated_failures, spent_cost,
-                        spent_risk, intervention_count, stopped, stop_reason)
+                        spent_risk, intervention_count, stopped, stop_reason,
+                        defer_budget=approval_required)
                 decisions.append(decision)
                 if became_stopped:
                     stopped = True
                     stop_reason = current_stop_reason
                 if spec is not None and decision["action"]["selected"]:
-                    manager.start(spec, at_ms)
-                    if spec.end_ms is not None:
-                        push(spec.end_ms, 1, "inject_end", {"id": spec.id})
-                        scheduled_ends.append(spec.end_ms)
+                    if approval_required:
+                        # 仅生成建议，等待人工确认后才实际生效。
+                        template = scenario.adaptive_policy["actions"][
+                            decision["severity"]]
+                        suggestion = {
+                            "id": spec.id,
+                            "decision_index": payload["index"],
+                            "suggested_at_ms": at_ms,
+                            "valid_until_ms": (
+                                None if expires_after_ms is None
+                                else at_ms + int(expires_after_ms)),
+                            "severity": decision["severity"],
+                            "basis": {
+                                "window_observation_ids":
+                                    decision["window_observation_ids"],
+                                "arrived_observation_ids":
+                                    decision["arrived_observation_ids"],
+                                "new_failure_ids": decision["new_failure_ids"],
+                            },
+                            "spec": self._injection_to_dict(spec),
+                            "cost": float(template.get("cost", 0)),
+                            "risk": float(template.get("risk", 0)),
+                            "template": dict(template),
+                            "status": "pending",
+                            "events": [],
+                        }
+                        suggestions.append(suggestion)
+                        decision["action"]["suggestion_id"] = suggestion["id"]
+                        decision["action"]["approval"] = "pending"
                     else:
-                        active_open_effect_ids.add(spec.id)
+                        manager.start(spec, at_ms)
+                        if spec.end_ms is not None:
+                            push(spec.end_ms, 1, "inject_end", {"id": spec.id})
+                            scheduled_ends.append(spec.end_ms)
+                        else:
+                            active_open_effect_ids.add(spec.id)
+                schedule_finish_if_complete()
+            elif kind == "approval":
+                event = payload["event"]
+                action = event.get("action", "confirm")
+                suggestion = find_suggestion(event)
+                record = {
+                    "at_ms": at_ms,
+                    "action": action,
+                    "suggestion_id": None if suggestion is None else suggestion["id"],
+                }
+                if suggestion is None:
+                    record.update({"outcome": "ignored",
+                                   "reason": "unknown_suggestion"})
+                elif action == "confirm":
+                    if suggestion["status"] != "pending":
+                        record.update({"outcome": "rejected",
+                                       "reason": f"suggestion_{suggestion['status']}"})
+                    elif cancelled:
+                        record.update({"outcome": "rejected",
+                                       "reason": "experiment_cancelled"})
+                    elif closed or stopped:
+                        # 已触发的停止条件不能被过期/迟到确认绕过。
+                        record.update({"outcome": "rejected",
+                                       "reason": "stop_condition_active"})
+                    else:
+                        # 确认时按当时的风险余额重新检查。
+                        check_reason = None
+                        max_count = limits.get("max_interventions")
+                        max_cost = limits.get("max_cost")
+                        max_risk = limits.get("max_risk")
+                        if (max_count is not None
+                                and intervention_count >= int(max_count)):
+                            check_reason = "max_interventions_reached"
+                        elif (max_cost is not None and spent_cost
+                                + suggestion["cost"] > float(max_cost)):
+                            check_reason = "budget_exhausted"
+                        elif (max_risk is not None and spent_risk
+                                + suggestion["risk"] > float(max_risk)):
+                            check_reason = "risk_limit_reached"
+                        if check_reason is not None:
+                            stopped = True
+                            stop_reason = check_reason
+                            record.update({"outcome": "rejected",
+                                           "reason": check_reason})
+                        else:
+                            candidate = InjectionSpec(
+                                id=suggestion["id"],
+                                type_name=suggestion["spec"]["type"],
+                                target=suggestion["spec"]["target"],
+                                start_ms=at_ms,
+                                end_ms=self._action_end(
+                                    at_ms, suggestion["template"], horizon_ms),
+                                params=suggestion["spec"]["params"],
+                            )
+                            conflicts = manager.conflicting_ids(candidate)
+                            if conflicts and not allow_overlap:
+                                # 范围被在生效干预占用：保持待确认，可稍后再试。
+                                record.update({
+                                    "outcome": "deferred",
+                                    "reason": "scope_contention",
+                                    "conflicting_intervention_ids": conflicts,
+                                })
+                            else:
+                                manager.start(candidate, at_ms)
+                                spent_cost += suggestion["cost"]
+                                spent_risk += suggestion["risk"]
+                                intervention_count += 1
+                                suggestion["status"] = "effective"
+                                suggestion["effective_at_ms"] = at_ms
+                                if candidate.end_ms is not None:
+                                    push(candidate.end_ms, 1, "inject_end",
+                                         {"id": candidate.id})
+                                    scheduled_ends.append(candidate.end_ms)
+                                else:
+                                    active_open_effect_ids.add(candidate.id)
+                                record.update({
+                                    "outcome": "confirmed",
+                                    "effective_at_ms": at_ms,
+                                    "budget_after": {
+                                        "cost": spent_cost,
+                                        "risk": spent_risk,
+                                        "interventions": intervention_count,
+                                    },
+                                })
+                elif action == "abandon":
+                    if suggestion["status"] != "pending":
+                        record.update({"outcome": "rejected",
+                                       "reason": f"suggestion_{suggestion['status']}"})
+                    else:
+                        # 放弃尚未生效的建议，不改写任何历史观察。
+                        suggestion["status"] = "abandoned"
+                        suggestion["abandoned_at_ms"] = at_ms
+                        record.update({"outcome": "abandoned"})
+                elif action == "withdraw":
+                    if suggestion["status"] != "effective":
+                        record.update({"outcome": "rejected",
+                                       "reason": f"suggestion_{suggestion['status']}"})
+                    else:
+                        # 撤回已生效干预：按原有收尾约定撤销效果。
+                        manager.end(suggestion["id"], at_ms)
+                        active_open_effect_ids.discard(suggestion["id"])
+                        suggestion["status"] = "withdrawn"
+                        suggestion["withdrawn_at_ms"] = at_ms
+                        record.update({"outcome": "withdrawn"})
+                else:
+                    record.update({"outcome": "ignored",
+                                   "reason": "unknown_action"})
+                if suggestion is not None:
+                    suggestion["events"].append(record)
                 schedule_finish_if_complete()
             elif kind == "decision":
                 pending_decisions -= 1
@@ -210,6 +392,10 @@ class AdaptiveEngine:
                 pending_decisions = 0
                 active_open_effect_ids.clear()
                 manager.recover_all(at_ms, reason="experiment_cancelled")
+                for suggestion in suggestions:
+                    if suggestion["status"] == "pending":
+                        suggestion["status"] = "expired"
+                        suggestion["expired_at_ms"] = at_ms
             elif kind == "close":
                 closed = True
                 pending_request_starts = 0
@@ -222,11 +408,14 @@ class AdaptiveEngine:
 
         if not manager.is_empty():
             raise RuntimeError("演练结束后仍有故障未恢复")
-        return observations, decisions, stopped, stop_reason, manager.history
+        expire_pending(horizon_ms if horizon_ms is not None else 0)
+        return (observations, decisions, stopped, stop_reason, manager.history,
+                suggestions)
 
     def _decide(self, scenario, thresholds, observations, decision_index, at_ms,
                 horizon_ms, branch_id, escalated_failures, spent_cost, spent_risk,
-                intervention_count, already_stopped=False, existing_stop_reason=None):
+                intervention_count, already_stopped=False, existing_stop_reason=None,
+                defer_budget=False):
         window_start = at_ms - int(thresholds.get("window_ms", 0))
         window = [o for o in observations
                   if window_start <= o.available_at_ms <= at_ms]
@@ -292,9 +481,11 @@ class AdaptiveEngine:
             else:
                 spec = candidate
                 action_dict["selected"] = True
-                spent_cost += cost
-                spent_risk += risk
-                intervention_count += 1
+                if not defer_budget:
+                    # 需要人工确认时，预算在实际确认生效时才扣减。
+                    spent_cost += cost
+                    spent_risk += risk
+                    intervention_count += 1
                 escalated_failures.update(new_failures)
             if local_stop_reason:
                 action_dict["skip_reason"] = local_stop_reason

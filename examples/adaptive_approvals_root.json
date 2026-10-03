@@ -1,0 +1,5 @@
+[
+  {"decision_index": 0, "at_ms": 120, "action": "confirm"},
+  {"decision_index": 1, "at_ms": 130, "action": "confirm"},
+  {"decision_index": 1, "at_ms": 230, "action": "confirm"}
+]

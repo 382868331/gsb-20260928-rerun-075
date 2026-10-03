@@ -160,6 +160,14 @@ class FaultManager:
              for active in effects}
         )
 
+    def conflicting_ids(self, spec: InjectionSpec) -> list[str]:
+        """返回与 spec 作用范围（维度+目标）相同的在生效注入 ID。"""
+        handle = self.registry.get(spec.type_name).create_handle(spec)
+        return sorted(
+            active.handle.injection_id
+            for active in self._effects.get(self._key(handle), [])
+        )
+
     def added_latency_ns(self, target: str) -> int:
         return sum(
             active.handle.value_ns

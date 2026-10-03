@@ -27,6 +27,13 @@
   样本数低于 `min_observations` 时持续标记为 `undetermined`。
 - **独立阈值分支**：可用另一套阈值重跑相同输入和对照组，治疗观察、动作和解释独立保存，
   不覆盖原分支；解释区分干预、系统变化和自然失败。
+- **人工确认干预**：`adaptive_policy.approval.required` 开启后，决策只产生
+  **建议（pending）**，由 `approvals` 事件（`confirm`/`abandon`/`withdraw`）驱动：
+  确认时按当时的风险余额、在生效干预和停止条件重新检查，过期建议
+  （`expires_after_ms`）不能绕过已触发的停止；同一（维度, 目标）范围被占用时
+  确认被暂缓（`scope_contention`），须等前一项结束或撤回后重试。放弃未生效建议
+  不改写历史观察；撤回已生效干预按原收尾约定撤销，并记录
+  `affected_observation_ids`。未获批准的建议不会出现在 `fault_events` 中。
 
 ## 目录结构
 
@@ -49,6 +56,10 @@
   --thresholds examples/adaptive_thresholds_root.json \
   --alternate-thresholds examples/adaptive_thresholds_alt.json \
   -o /tmp/adaptive.json
+.venv/bin/python -m chaos_platform adaptive-run examples/adaptive_approval.json \
+  --thresholds examples/adaptive_approval_thresholds.json \
+  --approvals examples/adaptive_approvals_root.json \
+  -o /tmp/adaptive_approval.json
 .venv/bin/python -m chaos_platform replay /tmp/adaptive.json
 .venv/bin/python -m pytest -q
 ```

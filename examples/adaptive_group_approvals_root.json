@@ -1,0 +1,4 @@
+[
+  {"group_id": "g-all", "at_ms": 400, "action": "abandon"},
+  {"group_id": "g-any", "at_ms": 460, "action": "confirm"}
+]

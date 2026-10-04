@@ -57,7 +57,7 @@ class AdaptiveEngine:
             horizon = max(horizon, max(int(a["at_ms"]) for a in approvals))
 
         control = self._run_control(scenario, branch_id)
-        treatment, decisions, stopped, stop_reason, fault_events, suggestions = \
+        treatment, decisions, stopped, stop_reason, fault_events, suggestions, groups = \
             self._run_treatment(scenario, thresholds, decision_times, horizon,
                                 branch_id, group_name, approvals or [])
         control_by_id = {o.request_id: o for o in control}
@@ -76,6 +76,7 @@ class AdaptiveEngine:
             "thresholds": dict(thresholds),
             "approvals": [dict(a) for a in (approvals or [])],
             "suggestions": suggestions,
+            "groups": groups,
             "control_observations": [o.to_dict() for o in control],
             "observations": [o.to_dict() for o in treatment],
             "comparisons": comparisons,
@@ -127,6 +128,25 @@ class AdaptiveEngine:
         allow_overlap = bool(approval_cfg.get("allow_overlap", False))
         expires_after_ms = approval_cfg.get("expires_after_ms")
         limits = policy.get("limits", {})
+        group_configs = {g["id"]: g for g in approval_cfg.get("groups", [])}
+        decision_to_group: dict[int, str] = {}
+        for group_cfg in group_configs.values():
+            for decision_idx in group_cfg.get("decision_indices", []):
+                decision_to_group[int(decision_idx)] = group_cfg["id"]
+        groups: list[dict] = []
+        group_by_id: dict[str, dict] = {}
+        for group_cfg in group_configs.values():
+            record = {
+                "id": group_cfg["id"],
+                "mode": group_cfg.get("mode", "all_of"),
+                "status": "open",
+                "member_ids": [],
+                "budget": dict(group_cfg.get("budget", {})),
+                "spent": {"cost": 0.0, "risk": 0.0, "interventions": 0},
+                "events": [],
+            }
+            groups.append(record)
+            group_by_id[record["id"]] = record
         observations: list[AdaptiveObservation] = []
         decisions: list[dict] = []
         suggestions: list[dict] = []
@@ -164,6 +184,209 @@ class AdaptiveEngine:
             matches = [s for s in suggestions
                        if s["decision_index"] == decision_index]
             return matches[-1] if matches else None
+
+        def group_members(group_id):
+            return [s for s in suggestions if s.get("group_id") == group_id]
+
+        def build_candidate(suggestion, at_ms):
+            return InjectionSpec(
+                id=suggestion["id"],
+                type_name=suggestion["spec"]["type"],
+                target=suggestion["spec"]["target"],
+                start_ms=at_ms,
+                end_ms=self._action_end(at_ms, suggestion["template"],
+                                        horizon_ms),
+                params=suggestion["spec"]["params"],
+            )
+
+        def recheck_suggestion(suggestion, at_ms, planned):
+            """执行前复核：有效期、停止状态、全局限额、组合预算、范围争用。
+
+            planned 是本次组合确认中已排定执行成员的累计
+            (cost, risk, count)，保证整组确认不超组合预算。
+            """
+            if suggestion["status"] != "pending":
+                return f"suggestion_{suggestion['status']}"
+            if cancelled:
+                return "experiment_cancelled"
+            if closed or stopped:
+                return "stop_condition_active"
+            plan_cost, plan_risk, plan_count = planned
+            max_count = limits.get("max_interventions")
+            max_cost = limits.get("max_cost")
+            max_risk = limits.get("max_risk")
+            if (max_count is not None
+                    and intervention_count + plan_count >= int(max_count)):
+                return "max_interventions_reached"
+            if (max_cost is not None and spent_cost + plan_cost
+                    + suggestion["cost"] > float(max_cost)):
+                return "budget_exhausted"
+            if (max_risk is not None and spent_risk + plan_risk
+                    + suggestion["risk"] > float(max_risk)):
+                return "risk_limit_reached"
+            group_id = suggestion.get("group_id")
+            if group_id is not None:
+                record = group_by_id[group_id]
+                budget = record["budget"]
+                spent = record["spent"]
+                if (budget.get("max_interventions") is not None
+                        and spent["interventions"] + plan_count
+                        >= int(budget["max_interventions"])):
+                    return "group_budget_exhausted"
+                if (budget.get("max_cost") is not None
+                        and spent["cost"] + plan_cost + suggestion["cost"]
+                        > float(budget["max_cost"])):
+                    return "group_budget_exhausted"
+                if (budget.get("max_risk") is not None
+                        and spent["risk"] + plan_risk + suggestion["risk"]
+                        > float(budget["max_risk"])):
+                    return "group_budget_exhausted"
+            if not allow_overlap:
+                candidate = build_candidate(suggestion, at_ms)
+                if manager.conflicting_ids(candidate):
+                    return "scope_contention"
+            return None
+
+        def execute_suggestion(suggestion, at_ms):
+            nonlocal spent_cost, spent_risk, intervention_count
+            candidate = build_candidate(suggestion, at_ms)
+            manager.start(candidate, at_ms)
+            spent_cost += suggestion["cost"]
+            spent_risk += suggestion["risk"]
+            intervention_count += 1
+            group_id = suggestion.get("group_id")
+            if group_id is not None:
+                spent = group_by_id[group_id]["spent"]
+                spent["cost"] += suggestion["cost"]
+                spent["risk"] += suggestion["risk"]
+                spent["interventions"] += 1
+            suggestion["status"] = "effective"
+            suggestion["effective_at_ms"] = at_ms
+            if candidate.end_ms is not None:
+                push(candidate.end_ms, 1, "inject_end", {"id": candidate.id})
+                scheduled_ends.append(candidate.end_ms)
+            else:
+                active_open_effect_ids.add(candidate.id)
+
+        limit_reasons = {"max_interventions_reached", "budget_exhausted",
+                         "risk_limit_reached", "group_budget_exhausted"}
+
+        def handle_group_event(event, at_ms):
+            """组合确认/放弃：确认按成员快照核对，条件变化则整组拒绝。"""
+            nonlocal stopped, stop_reason
+            group_id = event.get("group_id")
+            action = event.get("action", "confirm")
+            record = group_by_id.get(group_id)
+            if record is None:
+                return
+            members = group_members(group_id)
+            group_event = {"at_ms": at_ms, "action": action,
+                           "group_id": group_id}
+            if action == "abandon":
+                abandoned = []
+                for suggestion in members:
+                    if suggestion["status"] == "pending":
+                        suggestion["status"] = "abandoned"
+                        suggestion["abandoned_at_ms"] = at_ms
+                        abandoned.append(suggestion["id"])
+                record["status"] = ("partially_effective"
+                                    if record["spent"]["interventions"]
+                                    else "abandoned")
+                group_event.update({"outcome": "abandoned",
+                                    "abandoned_ids": abandoned})
+            elif action == "confirm":
+                expected = event.get("members")
+                expected_ids = (sorted(str(m) for m in expected)
+                                if expected is not None
+                                else sorted(s["id"] for s in members))
+                confirmable = sorted(s["id"] for s in members
+                                     if s["status"] == "pending")
+                if record["mode"] == "all_of":
+                    # all_of：确认快照必须与当前全部待确认成员一致。
+                    conditions_ok = confirmable == expected_ids
+                else:
+                    # any_of：允许选择子集，但选中项必须全部仍然有效。
+                    conditions_ok = all(i in confirmable
+                                        for i in expected_ids)
+                if not conditions_ok:
+                    # 针对旧条件的整组确认不能套用到变化后的剩余建议。
+                    group_event.update({
+                        "outcome": "rejected",
+                        "reason": "conditions_changed",
+                        "expected_ids": expected_ids,
+                        "confirmable_ids": confirmable,
+                    })
+                else:
+                    planned = [0.0, 0.0, 0]
+                    results = []
+                    for suggestion in members:
+                        if (suggestion["status"] != "pending"
+                                or suggestion["id"] not in expected_ids):
+                            continue
+                        reason = recheck_suggestion(suggestion, at_ms, planned)
+                        if reason is None:
+                            planned[0] += suggestion["cost"]
+                            planned[1] += suggestion["risk"]
+                            planned[2] += 1
+                        elif reason in limit_reasons and not stopped:
+                            stopped = True
+                            stop_reason = reason
+                        results.append((suggestion, reason))
+                    failed = [r for _, r in results if r is not None]
+                    if record["mode"] == "all_of" and failed:
+                        # all_of 原子语义：任一复核失败则整组不执行。
+                        for suggestion, reason in results:
+                            suggestion["rechecks"].append({
+                                "at_ms": at_ms, "group_id": group_id,
+                                "outcome": "blocked",
+                                "reason": reason or "group_recheck_failed",
+                            })
+                        group_event.update({
+                            "outcome": "rejected",
+                            "reason": "group_recheck_failed",
+                            "failed_ids": [s["id"] for s, r in results
+                                           if r is not None],
+                        })
+                    else:
+                        executed = []
+                        for suggestion, reason in results:
+                            if reason is None:
+                                execute_suggestion(suggestion, at_ms)
+                                executed.append(suggestion["id"])
+                                suggestion["rechecks"].append({
+                                    "at_ms": at_ms, "group_id": group_id,
+                                    "outcome": "passed",
+                                })
+                            else:
+                                # 失效/超限部分保持待确认，不自动换成别的动作。
+                                suggestion["rechecks"].append({
+                                    "at_ms": at_ms, "group_id": group_id,
+                                    "outcome": "skipped",
+                                    "reason": reason,
+                                })
+                        total = len(record["member_ids"])
+                        done = record["spent"]["interventions"]
+                        record["status"] = ("effective" if done == total
+                                            else "partially_effective"
+                                            if done else "open")
+                        group_event.update({
+                            "outcome": ("confirmed" if len(executed)
+                                        == len(results)
+                                        else "partially_confirmed"),
+                            "executed_ids": executed,
+                            "skipped_ids": [s["id"] for s, r in results
+                                            if r is not None],
+                            "budget_after": {
+                                "cost": spent_cost,
+                                "risk": spent_risk,
+                                "interventions": intervention_count,
+                            },
+                            "group_spent": dict(record["spent"]),
+                        })
+            else:
+                group_event.update({"outcome": "ignored",
+                                    "reason": "unknown_action"})
+            record["events"].append(group_event)
 
         def schedule_finish_if_complete():
             nonlocal finish_scheduled
@@ -206,7 +429,22 @@ class AdaptiveEngine:
                 else:
                     active_open_effect_ids.add(payload["spec"].id)
             elif kind == "observation_available":
-                observations.append(payload["observation"])
+                observation = payload["observation"]
+                observations.append(observation)
+                # 组合成员在等待确认期间被新观察推翻依据：标记失效，
+                # 失效部分不能被确认，也不会被自动替换成另一个动作。
+                for suggestion in suggestions:
+                    group_id = suggestion.get("group_id")
+                    if (suggestion["status"] == "pending"
+                            and group_id is not None
+                            and group_configs[group_id].get(
+                                "invalidate_on_new_observation", True)
+                            and at_ms > suggestion["suggested_at_ms"]):
+                        suggestion["status"] = "invalidated"
+                        suggestion["invalidated_at_ms"] = at_ms
+                        suggestion["invalidated_by_observation_id"] = \
+                            observation.request_id
+                        suggestion["invalidation_reason"] = "basis_superseded"
                 active_requests -= 1
                 schedule_finish_if_complete()
             elif kind == "decision" and not cancelled and not closed:
@@ -247,8 +485,13 @@ class AdaptiveEngine:
                             "template": dict(template),
                             "status": "pending",
                             "events": [],
+                            "rechecks": [],
+                            "group_id": decision_to_group.get(payload["index"]),
                         }
                         suggestions.append(suggestion)
+                        if suggestion["group_id"] is not None:
+                            group_by_id[suggestion["group_id"]][
+                                "member_ids"].append(suggestion["id"])
                         decision["action"]["suggestion_id"] = suggestion["id"]
                         decision["action"]["approval"] = "pending"
                     else:
@@ -262,6 +505,10 @@ class AdaptiveEngine:
             elif kind == "approval":
                 event = payload["event"]
                 action = event.get("action", "confirm")
+                if event.get("group_id") is not None:
+                    handle_group_event(event, at_ms)
+                    schedule_finish_if_complete()
+                    continue
                 suggestion = find_suggestion(event)
                 record = {
                     "at_ms": at_ms,
@@ -396,6 +643,9 @@ class AdaptiveEngine:
                     if suggestion["status"] == "pending":
                         suggestion["status"] = "expired"
                         suggestion["expired_at_ms"] = at_ms
+                for record in groups:
+                    if record["status"] == "open":
+                        record["status"] = "closed"
             elif kind == "close":
                 closed = True
                 pending_request_starts = 0
@@ -410,7 +660,7 @@ class AdaptiveEngine:
             raise RuntimeError("演练结束后仍有故障未恢复")
         expire_pending(horizon_ms if horizon_ms is not None else 0)
         return (observations, decisions, stopped, stop_reason, manager.history,
-                suggestions)
+                suggestions, groups)
 
     def _decide(self, scenario, thresholds, observations, decision_index, at_ms,
                 horizon_ms, branch_id, escalated_failures, spent_cost, spent_risk,

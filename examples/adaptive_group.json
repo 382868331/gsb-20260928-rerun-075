@@ -1,0 +1,44 @@
+{
+  "name": "组合审批演示",
+  "description": "相互依赖的建议组成组合共同确认：all_of 需全部同时满足，any_of 允许子集；确认前复核有效期、范围与组合预算。",
+  "seed": 20261004,
+  "cancel_at_ms": null,
+  "adaptive_policy": {
+    "decision_at_ms": [200, 210, 300, 310],
+    "limits": {"max_interventions": 5, "max_cost": 5, "max_risk": 5},
+    "approval": {
+      "required": true,
+      "expires_after_ms": 500,
+      "allow_overlap": false,
+      "groups": [
+        {"id": "g-all", "mode": "all_of", "decision_indices": [0, 1],
+         "budget": {"max_cost": 2, "max_risk": 2}},
+        {"id": "g-any", "mode": "any_of", "decision_indices": [2, 3],
+         "budget": {"max_cost": 1, "max_risk": 1}}
+      ]
+    },
+    "actions": {
+      "degraded": {
+        "type": "latency",
+        "target": "billing",
+        "duration_ms": 50,
+        "params": {"delay_ms": 20},
+        "cost": 1,
+        "risk": 1
+      },
+      "failed": {
+        "type": "interruption",
+        "target": "inventory",
+        "duration_ms": 50,
+        "params": {},
+        "cost": 1,
+        "risk": 1
+      }
+    }
+  },
+  "requests": [
+    {"at_ms": 50, "payload": {"user": "alice"}},
+    {"at_ms": 90, "payload": {"user": "bob"}}
+  ],
+  "injections": []
+}

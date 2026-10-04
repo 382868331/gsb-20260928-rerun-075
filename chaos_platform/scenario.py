@@ -108,6 +108,20 @@ def validate_scenario(scenario: Scenario) -> None:
         if (approval.get("expires_after_ms") is not None
                 and int(approval["expires_after_ms"]) < 0):
             raise ValueError("approval.expires_after_ms 不能为负数")
+        group_ids: set[str] = set()
+        for group in approval.get("groups", []):
+            group_id = group.get("id")
+            if not group_id:
+                raise ValueError("approval.groups[] 缺少 id")
+            if group_id in group_ids:
+                raise ValueError(f"组合 ID 重复: {group_id}")
+            group_ids.add(group_id)
+            if group.get("mode", "all_of") not in ("all_of", "any_of"):
+                raise ValueError(f"组合 {group_id} 的 mode 只能是 all_of/any_of")
+            for name in ("max_interventions", "max_cost", "max_risk"):
+                budget = group.get("budget", {})
+                if name in budget and budget[name] < 0:
+                    raise ValueError(f"组合 {group_id} 的 {name} 不能为负数")
 
 
 def save_scenario(scenario: Scenario, path: str | Path) -> Path:

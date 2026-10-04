@@ -50,6 +50,11 @@ def _print_adaptive_summary(result: dict) -> None:
                     counts.get(suggestion["status"], 0) + 1
             detail = ", ".join(f"{k}:{v}" for k, v in sorted(counts.items()))
             print(f"  建议 {len(suggestions)} 条（{detail}）")
+        for group in branch.get("groups", []):
+            spent = group["spent"]
+            print(f"  组合 {group['id']}（{group['mode']}）: {group['status']}，"
+                  f"成员 {len(group['member_ids'])}，"
+                  f"已执行 {spent['interventions']}")
 
 
 def main(argv: list[str] | None = None) -> int:

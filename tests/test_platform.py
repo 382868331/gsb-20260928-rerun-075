@@ -444,3 +444,185 @@ def test_approval_run_saves_and_replays(tmp_path: Path):
         scenario_from_dict(saved["scenario"]), dict(_APPROVAL_THRESHOLDS),
         approvals=saved["result"]["branches"][0]["approvals"])
     assert replayed == saved["result"]
+
+
+def _group_scenario(mode="all_of", budget=None, limits=None,
+                    expires_after_ms=500, request_times=(50, 60),
+                    decision_times=(72, 82), invalidate=False):
+    policy = {
+        "decision_at_ms": list(decision_times),
+        "limits": limits or {},
+        "approval": {
+            "required": True,
+            "expires_after_ms": expires_after_ms,
+            "allow_overlap": True,
+            "groups": [{
+                "id": "g1",
+                "mode": mode,
+                "decision_indices": list(range(len(decision_times))),
+                "budget": budget or {},
+                "invalidate_on_new_observation": invalidate,
+            }],
+        },
+        "actions": {
+            "failed": {
+                "type": "interruption", "target": "inventory",
+                "duration_ms": 100, "params": {}, "cost": 1, "risk": 1,
+            },
+        },
+    }
+    return Scenario(
+        name="group", seed=7,
+        requests=[RequestSpec(t, {"i": i}) for i, t in enumerate(request_times)],
+        adaptive_policy=policy,
+    )
+
+
+def _run_group(approvals, **kwargs):
+    scenario = _group_scenario(**kwargs)
+    return ExperimentRunner(_FailingChain()).run_adaptive_branch(
+        scenario, {**_APPROVAL_THRESHOLDS, "window_ms": 5},
+        approvals=approvals)
+
+
+def _run_group_wide_window(approvals, **kwargs):
+    scenario = _group_scenario(**kwargs)
+    return ExperimentRunner(_FailingChain()).run_adaptive_branch(
+        scenario, dict(_APPROVAL_THRESHOLDS), approvals=approvals)
+
+
+def test_group_all_of_confirm_executes_all_together():
+    # all_of：整组条件同时满足才执行，确认后全部成员一起生效。
+    branch = _run_group(
+        [{"group_id": "g1", "at_ms": 120, "action": "confirm"}])
+    first, second = branch["suggestions"]
+    assert first["status"] == second["status"] == "effective"
+    assert first["effective_at_ms"] == second["effective_at_ms"] == 120
+    assert first["rechecks"] == [{"at_ms": 120, "group_id": "g1",
+                                  "outcome": "passed"}]
+    group = branch["groups"][0]
+    assert group["status"] == "effective"
+    assert group["spent"] == {"cost": 2.0, "risk": 2.0, "interventions": 2}
+    assert group["events"][0]["outcome"] == "confirmed"
+    started = [e for e in branch["fault_events"] if e["event"] == "inject_start"]
+    assert [e["id"] for e in started] == [first["id"], second["id"]]
+
+
+def test_group_late_confirmation_after_expiry_is_rejected():
+    # 迟到确认：整组已过期，确认不能复活任何成员。
+    branch = _run_group(
+        [{"group_id": "g1", "at_ms": 200, "action": "confirm"}],
+        expires_after_ms=50)
+    first, second = branch["suggestions"]
+    assert first["status"] == second["status"] == "expired"
+    group = branch["groups"][0]
+    assert group["events"][0]["outcome"] == "rejected"
+    assert group["events"][0]["reason"] == "conditions_changed"
+    assert group["spent"]["interventions"] == 0
+    assert branch["fault_events"] == []
+    assert branch["stopped"] is False
+
+
+def test_group_confirm_snapshot_not_applied_after_condition_change():
+    # 等待期间新观察使其中一项失效：针对旧条件的整组确认被拒绝，
+    # 不能套用到变化后的剩余建议；须按新快照重新确认。
+    branch = _run_group_wide_window(
+        [{"group_id": "g1", "at_ms": 160, "action": "confirm",
+          "members": ["root:d0:failed", "root:d1:failed"]},
+         {"group_id": "g1", "at_ms": 170, "action": "confirm",
+          "members": ["root:d1:failed"]}],
+        mode="any_of",
+        invalidate=True,
+        request_times=(50, 105),
+        decision_times=(100, 140))
+    first, second = branch["suggestions"]
+    # 请求 @105 的观察在 125ms 到达，推翻了 100ms 提出的第一条建议
+    assert first["status"] == "invalidated"
+    assert first["invalidated_at_ms"] == 125
+    assert first["invalidated_by_observation_id"] == 1
+    assert first["invalidation_reason"] == "basis_superseded"
+    group = branch["groups"][0]
+    stale, fresh = group["events"]
+    assert stale["outcome"] == "rejected"
+    assert stale["reason"] == "conditions_changed"
+    assert stale["confirmable_ids"] == [second["id"]]
+    # 旧确认没有套用到剩余建议：160ms 时第二条仍未生效
+    assert second["effective_at_ms"] == 170
+    assert fresh["outcome"] == "confirmed"
+    assert fresh["executed_ids"] == [second["id"]]
+    # 失效部分保持失效，没有被自动替换成另一个动作
+    assert first["status"] == "invalidated"
+    started = [e["id"] for e in branch["fault_events"]
+               if e["event"] == "inject_start"]
+    assert started == [second["id"]]
+
+
+def test_group_any_of_partial_execution_then_stop_keeps_facts():
+    # any_of + 组合预算只允许部分执行：停止后已执行部分保留事实，
+    # 整个组合不能被记成未执行。
+    branch = _run_group(
+        [{"group_id": "g1", "at_ms": 120, "action": "confirm"}],
+        mode="any_of", budget={"max_cost": 1, "max_risk": 1})
+    first, second = branch["suggestions"]
+    assert first["status"] == "effective"
+    assert second["status"] == "pending"
+    assert second["rechecks"][-1]["outcome"] == "skipped"
+    assert second["rechecks"][-1]["reason"] == "group_budget_exhausted"
+    group = branch["groups"][0]
+    assert group["status"] == "partially_effective"
+    assert group["spent"]["interventions"] == 1
+    assert group["events"][0]["outcome"] == "partially_confirmed"
+    assert group["events"][0]["executed_ids"] == [first["id"]]
+    assert group["events"][0]["skipped_ids"] == [second["id"]]
+    assert branch["stopped"] is True
+    assert branch["stop_reason"] == "group_budget_exhausted"
+    started = [e["id"] for e in branch["fault_events"]
+               if e["event"] == "inject_start"]
+    assert started == [first["id"]]
+
+
+def test_group_all_of_recheck_failure_blocks_whole_group():
+    # all_of 原子语义：组合预算放不下整组时，任一成员复核失败则全组不执行。
+    branch = _run_group(
+        [{"group_id": "g1", "at_ms": 120, "action": "confirm"}],
+        mode="all_of", budget={"max_cost": 1})
+    first, second = branch["suggestions"]
+    assert first["status"] == second["status"] == "pending"
+    assert first["rechecks"][-1]["outcome"] == "blocked"
+    assert second["rechecks"][-1]["reason"] == "group_budget_exhausted"
+    group = branch["groups"][0]
+    assert group["events"][0]["outcome"] == "rejected"
+    assert group["events"][0]["reason"] == "group_recheck_failed"
+    assert group["spent"]["interventions"] == 0
+    assert branch["fault_events"] == []
+
+
+def test_group_abandon_and_repropose_branches_save_and_replay(tmp_path: Path):
+    # 放弃组合与重新确认组合两个分支独立保存；保存/恢复后生命周期一致。
+    scenario = _group_scenario(mode="any_of",
+                               budget={"max_cost": 2, "max_risk": 2})
+    root_approvals = [{"group_id": "g1", "at_ms": 120, "action": "abandon"}]
+    alt_approvals = [{"group_id": "g1", "at_ms": 120, "action": "confirm"}]
+    runner = ExperimentRunner(_FailingChain())
+    result = runner.run_adaptive_experiment(
+        scenario, dict(_APPROVAL_THRESHOLDS), dict(_APPROVAL_THRESHOLDS),
+        approvals=root_approvals, alternate_approvals=alt_approvals)
+    root, alternate = result["branches"]
+    assert root["groups"][0]["status"] == "abandoned"
+    assert all(s["status"] == "abandoned" for s in root["suggestions"])
+    assert root["fault_events"] == []
+    assert alternate["groups"][0]["status"] == "effective"
+    assert all(s["status"] == "effective" for s in alternate["suggestions"])
+    # 每个建议都保留依据观察、人工确认与执行前复核
+    for suggestion in alternate["suggestions"]:
+        assert suggestion["basis"]["window_observation_ids"]
+        assert suggestion["rechecks"][0]["outcome"] == "passed"
+    path = tmp_path / "group.json"
+    save_adaptive_run(result, scenario, path)
+    saved = load_run(path)
+    replayed = runner.run_adaptive_experiment(
+        scenario_from_dict(saved["scenario"]),
+        dict(_APPROVAL_THRESHOLDS), dict(_APPROVAL_THRESHOLDS),
+        approvals=saved["result"]["branches"][0]["approvals"],
+        alternate_approvals=saved["result"]["branches"][1]["approvals"])
+    assert replayed == saved["result"]

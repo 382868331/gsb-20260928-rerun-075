@@ -34,6 +34,17 @@
   确认被暂缓（`scope_contention`），须等前一项结束或撤回后重试。放弃未生效建议
   不改写历史观察；撤回已生效干预按原收尾约定撤销，并记录
   `affected_observation_ids`。未获批准的建议不会出现在 `fault_events` 中。
+- **组合批准**：`approval.groups[]` 把相互依赖的建议编组共同确认。
+  `all_of` 要求整组条件同时满足、原子执行（任一成员复核失败则全组不执行）；
+  `any_of` 允许确认其中一部分（事件 `members` 选定子集）。确认按成员快照核对：
+  等待期间新观察可使成员失效（`invalidate_on_new_observation`，失效原因
+  `basis_superseded`），针对旧条件的整组确认会被拒绝（`conditions_changed`），
+  不会套用到变化后的剩余建议，须按新快照重新确认。执行前逐项复核有效期、
+  范围争用与组合预算（`budget.max_cost/max_risk/max_interventions`），
+  复核结果记入每条建议的 `rechecks`；失效部分保持原状，不会被自动替换成
+  另一个动作。`any_of` 部分执行后触发停止时，已执行成员保留
+  `effective` 事实与故障事件，组合记为 `partially_effective` 而非未执行。
+  放弃组合（`abandon`）与重新提出组合可在 root/alternate 分支分别保存比较。
 
 ## 目录结构
 
@@ -60,6 +71,12 @@
   --thresholds examples/adaptive_approval_thresholds.json \
   --approvals examples/adaptive_approvals_root.json \
   -o /tmp/adaptive_approval.json
+.venv/bin/python -m chaos_platform adaptive-run examples/adaptive_group.json \
+  --thresholds examples/adaptive_group_thresholds.json \
+  --alternate-thresholds examples/adaptive_group_thresholds_alt.json \
+  --approvals examples/adaptive_group_approvals_root.json \
+  --alternate-approvals examples/adaptive_group_approvals_alt.json \
+  -o /tmp/adaptive_group.json
 .venv/bin/python -m chaos_platform replay /tmp/adaptive.json
 .venv/bin/python -m pytest -q
 ```

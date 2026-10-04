@@ -176,3 +176,89 @@ def test_bundle_basis_and_precheck_remain_auditable():
     assert member["precheck"]["within_validity"] is True
     assert member["precheck"]["budget_before"] == {
         "cost": 0.0, "risk": 0.0, "interventions": 0}
+
+
+def _triple_bundle_scenario(limits):
+    policy = {
+        "decision_at_ms": [100, 115, 140],
+        "limits": limits,
+        "approval": {"required": True,
+                     "expires_after_ms": 200,
+                     "allow_overlap": False},
+        "actions": {"failed": {
+            "type": "interruption", "target": "inventory",
+            "duration_ms": 100, "params": {}, "cost": 1, "risk": 1}},
+    }
+    return Scenario(
+        name="bundle3", seed=7,
+        requests=[RequestSpec(50, {"i": 0}), RequestSpec(85, {"i": 1}),
+                  RequestSpec(105, {"i": 2})],
+        adaptive_policy=policy)
+
+
+T_IDS = ["root:d0:failed", "root:d1:failed", "root:d2:failed"]
+
+
+def _run_triple_bundle(limits):
+    return ExperimentRunner(_FailingChain()).run_adaptive_branch(
+        _triple_bundle_scenario(limits), dict(_APPROVAL_THRESHOLDS),
+        approvals=[{"at_ms": 160, "action": "confirm_bundle",
+                    "suggestion_ids": T_IDS, "mode": "partial"}])
+
+
+def _assert_partial_budget_stop(branch, limit_key, stop_reason):
+    run = branch["bundles"][0]
+    assert run["status"] == "partially_effective"
+    assert run["effective_suggestion_ids"] == T_IDS[:2]
+    assert run["rejected_suggestion_ids"] == T_IDS[2:]
+    members = {m["suggestion_id"]: m for m in run["members"]}
+    # 每项 precheck 反映实际执行前支出，而非组合开始快照。
+    assert members[T_IDS[0]]["precheck"]["budget_before"][limit_key] == 0.0
+    assert members[T_IDS[1]]["precheck"]["budget_before"][limit_key] == 1.0
+    assert members[T_IDS[2]]["precheck"]["budget_before"][limit_key] == 2.0
+    assert members[T_IDS[2]]["outcome"] == "rejected"
+    assert members[T_IDS[2]]["reason"] == stop_reason
+    # 途中停止：已生效事实与最终支出保留。
+    assert branch["stopped"] is True
+    assert branch["stop_reason"] == stop_reason
+    assert run["budget_after"][limit_key] == 2.0
+    starts = [e["id"] for e in branch["fault_events"]
+              if e["event"] == "inject_start"]
+    assert starts == T_IDS[:2]
+    statuses = {s["id"]: s["status"] for s in branch["suggestions"]}
+    assert statuses[T_IDS[0]] == "effective"
+    assert statuses[T_IDS[1]] == "effective"
+    assert statuses[T_IDS[2]] == "pending"
+
+
+def test_bundle_partial_precheck_reflects_actual_spend_cost(tmp_path: Path):
+    # 三项各耗 1、总预算 2：执行前支出依次为 0、1、2，第三项被拒绝。
+    scenario = _triple_bundle_scenario({"max_cost": 2})
+    thresholds = dict(_APPROVAL_THRESHOLDS)
+    approvals = [{"at_ms": 160, "action": "confirm_bundle",
+                  "suggestion_ids": T_IDS, "mode": "partial"}]
+    runner = ExperimentRunner(_FailingChain())
+    branch = runner.run_adaptive_branch(scenario, thresholds,
+                                        approvals=approvals)
+    _assert_partial_budget_stop(branch, "cost", "budget_exhausted")
+    # 保存重载与重复读取结果一致，可原样重放。
+    experiment = {"scenario_name": scenario.name, "seed": scenario.seed,
+                  "branches": [branch]}
+    path = tmp_path / "bundle_budget.json"
+    save_adaptive_run(experiment, scenario, path)
+    saved_first = load_run(path)
+    saved_second = load_run(path)
+    assert saved_first == saved_second
+    restored = saved_first["result"]["branches"][0]
+    assert restored["bundles"] == branch["bundles"]
+    _assert_partial_budget_stop(restored, "cost", "budget_exhausted")
+    replayed = runner.run_adaptive_branch(
+        scenario_from_dict(saved_first["scenario"]), thresholds,
+        approvals=saved_first["result"]["branches"][0]["approvals"])
+    assert replayed["bundles"] == branch["bundles"]
+
+
+def test_bundle_partial_precheck_reflects_actual_spend_risk():
+    # 风险预算同理：第三项执行前风险余额已耗尽。
+    branch = _run_triple_bundle({"max_risk": 2})
+    _assert_partial_budget_stop(branch, "risk", "risk_limit_reached")

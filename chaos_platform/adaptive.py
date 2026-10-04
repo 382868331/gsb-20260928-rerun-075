@@ -355,6 +355,20 @@ class AdaptiveEngine:
                 run["status"] = "partially_effective" if any_blocked else "effective"
             for check in checks:
                 member = check["member"]
+                if not (mode == "all" and any_blocked):
+                    # 逐项复核：快照与预算按该成员实际执行前的支出重新计算，
+                    # 不能复用组合开始时的快照。
+                    check["snapshot"] = precheck_snapshot(member, at_ms)
+                    if check["reason"] is None:
+                        if (max_count is not None
+                                and intervention_count + 1 > int(max_count)):
+                            check["reason"] = "max_interventions_reached"
+                        elif (max_cost is not None and spent_cost
+                              + member["cost"] > float(max_cost)):
+                            check["reason"] = "budget_exhausted"
+                        elif (max_risk is not None and spent_risk
+                              + member["risk"] > float(max_risk)):
+                            check["reason"] = "risk_limit_reached"
                 member_record = {
                     "at_ms": at_ms,
                     "action": "confirm_bundle",

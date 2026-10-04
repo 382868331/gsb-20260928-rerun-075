@@ -57,9 +57,10 @@ class AdaptiveEngine:
             horizon = max(horizon, max(int(a["at_ms"]) for a in approvals))
 
         control = self._run_control(scenario, branch_id)
-        treatment, decisions, stopped, stop_reason, fault_events, suggestions = \
-            self._run_treatment(scenario, thresholds, decision_times, horizon,
-                                branch_id, group_name, approvals or [])
+        (treatment, decisions, stopped, stop_reason, fault_events, suggestions,
+         bundle_runs) = self._run_treatment(
+            scenario, thresholds, decision_times, horizon,
+            branch_id, group_name, approvals or [])
         control_by_id = {o.request_id: o for o in control}
         comparisons = [self._compare(control_by_id[o.request_id], o)
                        for o in treatment]
@@ -76,6 +77,7 @@ class AdaptiveEngine:
             "thresholds": dict(thresholds),
             "approvals": [dict(a) for a in (approvals or [])],
             "suggestions": suggestions,
+            "bundles": bundle_runs,
             "control_observations": [o.to_dict() for o in control],
             "observations": [o.to_dict() for o in treatment],
             "comparisons": comparisons,
@@ -130,6 +132,7 @@ class AdaptiveEngine:
         observations: list[AdaptiveObservation] = []
         decisions: list[dict] = []
         suggestions: list[dict] = []
+        bundle_runs: list[dict] = []
         escalated_failures: set[int] = set()
         spent_cost = 0.0
         spent_risk = 0.0
@@ -176,6 +179,239 @@ class AdaptiveEngine:
                                 default=horizon_ms)
                 push(finish_at, 3, "finish")
                 finish_scheduled = True
+
+        def build_candidate(suggestion, at_ms):
+            return InjectionSpec(
+                id=suggestion["id"],
+                type_name=suggestion["spec"]["type"],
+                target=suggestion["spec"]["target"],
+                start_ms=at_ms,
+                end_ms=self._action_end(
+                    at_ms, suggestion["template"], horizon_ms),
+                params=suggestion["spec"]["params"],
+            )
+
+        def precheck_snapshot(suggestion, at_ms):
+            """执行前复核：有效期、当前状态、范围占用、预算（调用方补预算结论）。"""
+            return {
+                "checked_at_ms": at_ms,
+                "suggestion_status": suggestion["status"],
+                "suggested_at_ms": suggestion["suggested_at_ms"],
+                "valid_until_ms": suggestion["valid_until_ms"],
+                "within_validity": (
+                    suggestion["valid_until_ms"] is None
+                    or at_ms <= suggestion["valid_until_ms"]),
+                "budget_before": {
+                    "cost": spent_cost,
+                    "risk": spent_risk,
+                    "interventions": intervention_count,
+                },
+            }
+
+        def validate_member(suggestion, at_ms):
+            """返回 (reason, conflicts, candidate)；reason 为 None 表示可执行。
+
+            范围争用只检查在生效的外部干预；同一组合成员被视为共同批准，
+            互不占范围（预算与有效期在调用方按组合整体复核）。
+            """
+            if cancelled:
+                return "experiment_cancelled", [], None
+            if closed or stopped:
+                # 已触发的停止条件不能被迟到确认绕过。
+                return "stop_condition_active", [], None
+            if suggestion["status"] != "pending":
+                return f"suggestion_{suggestion['status']}", [], None
+            max_count = limits.get("max_interventions")
+            max_cost = limits.get("max_cost")
+            max_risk = limits.get("max_risk")
+            if (max_count is not None
+                    and intervention_count >= int(max_count)):
+                return "max_interventions_reached", [], None
+            if (max_cost is not None and spent_cost
+                    + suggestion["cost"] > float(max_cost)):
+                return "budget_exhausted", [], None
+            if (max_risk is not None and spent_risk
+                    + suggestion["risk"] > float(max_risk)):
+                return "risk_limit_reached", [], None
+            candidate = build_candidate(suggestion, at_ms)
+            conflicts = list(manager.conflicting_ids(candidate))
+            if conflicts and not allow_overlap:
+                return "scope_contention", sorted(set(conflicts)), candidate
+            return None, [], candidate
+
+        def apply_member(suggestion, candidate, at_ms):
+            nonlocal spent_cost, spent_risk, intervention_count
+            manager.start(candidate, at_ms)
+            spent_cost += suggestion["cost"]
+            spent_risk += suggestion["risk"]
+            intervention_count += 1
+            suggestion["status"] = "effective"
+            suggestion["effective_at_ms"] = at_ms
+            if candidate.end_ms is not None:
+                push(candidate.end_ms, 1, "inject_end", {"id": candidate.id})
+                scheduled_ends.append(candidate.end_ms)
+            else:
+                active_open_effect_ids.add(candidate.id)
+
+        def handle_bundle_event(event, action, at_ms):
+            """处理组合批准/放弃，返回组合不可解析时的忽略原因或 None。
+
+            组合确认针对事件中显式列出的成员快照；失效成员不会被自动替换为
+            其他动作。all 模式任一成员复核失败则整组不执行；partial 模式
+            只执行通过复核的成员，已生效事实保留。
+            """
+            nonlocal stopped, stop_reason
+            raw_ids = event.get("suggestion_ids")
+            if not raw_ids:
+                return "missing_suggestion_ids"
+            by_id = {s["id"]: s for s in suggestions}
+            unknown = [sid for sid in raw_ids if sid not in by_id]
+            if unknown:
+                return f"unknown_suggestion:{unknown[0]}"
+            if len(set(raw_ids)) != len(raw_ids):
+                return "duplicate_suggestion_ids"
+            mode = event.get("mode", "all")
+            run = {
+                "id": f"bundle@{at_ms}:{len(bundle_runs)}",
+                "at_ms": at_ms,
+                "action": action,
+                "mode": mode,
+                "suggestion_ids": list(raw_ids),
+                "members": [],
+            }
+            ordered = [by_id[sid] for sid in raw_ids]
+            if action == "abandon_bundle":
+                run["status"] = "abandoned"
+                for member in ordered:
+                    member_record = {
+                        "at_ms": at_ms,
+                        "action": "abandon_bundle",
+                        "bundle_id": run["id"],
+                        "suggestion_id": member["id"],
+                    }
+                    if member["status"] != "pending":
+                        member_record.update({
+                            "outcome": "rejected",
+                            "reason": f"suggestion_{member['status']}",
+                        })
+                    else:
+                        member["status"] = "abandoned"
+                        member["abandoned_at_ms"] = at_ms
+                        member_record.update({"outcome": "abandoned"})
+                    member["events"].append(member_record)
+                    run["members"].append(member_record)
+                bundle_runs.append(run)
+                return None
+            if mode not in ("all", "partial"):
+                run["status"] = "rejected"
+                run["reject_reason"] = "unknown_mode"
+                bundle_runs.append(run)
+                return "unknown_mode"
+            # 执行前复核：对全部成员检查有效期、状态、范围与组合预算。
+            checks = []
+            started_specs = []
+            projected_cost = spent_cost
+            projected_risk = spent_risk
+            projected_count = intervention_count
+            max_count = limits.get("max_interventions")
+            max_cost = limits.get("max_cost")
+            max_risk = limits.get("max_risk")
+            for member in ordered:
+                snapshot = precheck_snapshot(member, at_ms)
+                reason, conflicts, candidate = validate_member(
+                    member, at_ms)
+                budget_ok = True
+                budget_reason = None
+                if reason is None:
+                    if (max_count is not None
+                            and projected_count + 1 > int(max_count)):
+                        budget_ok, budget_reason = False, "max_interventions_reached"
+                    elif (max_cost is not None and projected_cost
+                          + member["cost"] > float(max_cost)):
+                        budget_ok, budget_reason = False, "budget_exhausted"
+                    elif (max_risk is not None and projected_risk
+                          + member["risk"] > float(max_risk)):
+                        budget_ok, budget_reason = False, "risk_limit_reached"
+                checks.append({
+                    "member": member,
+                    "snapshot": snapshot,
+                    "reason": budget_reason if (reason is None and not budget_ok)
+                    else reason,
+                    "conflicts": conflicts,
+                    "candidate": candidate,
+                })
+                if reason is None and budget_ok:
+                    started_specs.append(build_candidate(member, at_ms))
+                    projected_cost += member["cost"]
+                    projected_risk += member["risk"]
+                    projected_count += 1
+            any_blocked = any(c["reason"] is not None for c in checks)
+            effective_ids = []
+            rejected_ids = []
+            if mode == "all" and any_blocked:
+                run["status"] = "rejected"
+                run["reject_reason"] = "precheck_failed"
+            else:
+                run["status"] = "partially_effective" if any_blocked else "effective"
+            for check in checks:
+                member = check["member"]
+                member_record = {
+                    "at_ms": at_ms,
+                    "action": "confirm_bundle",
+                    "bundle_id": run["id"],
+                    "mode": mode,
+                    "suggestion_id": member["id"],
+                    "precheck": check["snapshot"],
+                }
+                blocked_by_mode = (mode == "all" and any_blocked)
+                if blocked_by_mode:
+                    member_record.update({
+                        "outcome": "rejected",
+                        "reason": check["reason"] or "bundle_precheck_failed",
+                    })
+                    rejected_ids.append(member["id"])
+                    if check["reason"] == "scope_contention":
+                        member_record["conflicting_intervention_ids"] = check[
+                            "conflicts"]
+                elif check["reason"] is not None:
+                    member_record["outcome"] = (
+                        "deferred" if check["reason"] == "scope_contention"
+                        else "rejected")
+                    member_record["reason"] = check["reason"]
+                    if member_record["outcome"] == "rejected":
+                        rejected_ids.append(member["id"])
+                    if check["reason"] == "scope_contention":
+                        member_record["conflicting_intervention_ids"] = check[
+                            "conflicts"]
+                    if check["reason"] in ("max_interventions_reached",
+                                            "budget_exhausted",
+                                            "risk_limit_reached"):
+                        # 预算类失败触发停止，后续成员不再执行（失效不替换）。
+                        stopped = True
+                        stop_reason = check["reason"]
+                else:
+                    apply_member(member, check["candidate"], at_ms)
+                    effective_ids.append(member["id"])
+                    member_record.update({
+                        "outcome": "confirmed",
+                        "effective_at_ms": at_ms,
+                        "budget_after": {
+                            "cost": spent_cost,
+                            "risk": spent_risk,
+                            "interventions": intervention_count,
+                        },
+                    })
+                member["events"].append(member_record)
+                run["members"].append(member_record)
+            run["effective_suggestion_ids"] = effective_ids
+            run["rejected_suggestion_ids"] = rejected_ids
+            run["budget_after"] = {
+                "cost": spent_cost,
+                "risk": spent_risk,
+                "interventions": intervention_count,
+            }
+            bundle_runs.append(run)
+            return None
 
         while queue:
             at_ms, order, _, kind, payload = heapq.heappop(queue)
@@ -268,80 +504,51 @@ class AdaptiveEngine:
                     "action": action,
                     "suggestion_id": None if suggestion is None else suggestion["id"],
                 }
-                if suggestion is None:
+                if action in ("confirm_bundle", "abandon_bundle"):
+                    # 组合事件写入 bundle 审计与各成员 events，不使用单条 record。
+                    ignore_reason = handle_bundle_event(event, action, at_ms)
+                    if ignore_reason is not None:
+                        record.update({"outcome": "ignored",
+                                       "reason": ignore_reason,
+                                       "suggestion_id": None})
+                    else:
+                        record = None
+                elif suggestion is None:
                     record.update({"outcome": "ignored",
                                    "reason": "unknown_suggestion"})
                 elif action == "confirm":
-                    if suggestion["status"] != "pending":
-                        record.update({"outcome": "rejected",
-                                       "reason": f"suggestion_{suggestion['status']}"})
-                    elif cancelled:
-                        record.update({"outcome": "rejected",
-                                       "reason": "experiment_cancelled"})
-                    elif closed or stopped:
-                        # 已触发的停止条件不能被过期/迟到确认绕过。
-                        record.update({"outcome": "rejected",
-                                       "reason": "stop_condition_active"})
-                    else:
-                        # 确认时按当时的风险余额重新检查。
-                        check_reason = None
-                        max_count = limits.get("max_interventions")
-                        max_cost = limits.get("max_cost")
-                        max_risk = limits.get("max_risk")
-                        if (max_count is not None
-                                and intervention_count >= int(max_count)):
-                            check_reason = "max_interventions_reached"
-                        elif (max_cost is not None and spent_cost
-                                + suggestion["cost"] > float(max_cost)):
-                            check_reason = "budget_exhausted"
-                        elif (max_risk is not None and spent_risk
-                                + suggestion["risk"] > float(max_risk)):
-                            check_reason = "risk_limit_reached"
-                        if check_reason is not None:
+                    snapshot = precheck_snapshot(suggestion, at_ms)
+                    check_reason, conflicts, candidate = validate_member(
+                        suggestion, at_ms)
+                    if check_reason == "scope_contention":
+                        # 范围被在生效干预占用：保持待确认，可稍后再试。
+                        record.update({
+                            "outcome": "deferred",
+                            "reason": "scope_contention",
+                            "conflicting_intervention_ids": conflicts,
+                            "precheck": snapshot,
+                        })
+                    elif check_reason is not None:
+                        if check_reason in ("max_interventions_reached",
+                                            "budget_exhausted",
+                                            "risk_limit_reached"):
                             stopped = True
                             stop_reason = check_reason
-                            record.update({"outcome": "rejected",
-                                           "reason": check_reason})
-                        else:
-                            candidate = InjectionSpec(
-                                id=suggestion["id"],
-                                type_name=suggestion["spec"]["type"],
-                                target=suggestion["spec"]["target"],
-                                start_ms=at_ms,
-                                end_ms=self._action_end(
-                                    at_ms, suggestion["template"], horizon_ms),
-                                params=suggestion["spec"]["params"],
-                            )
-                            conflicts = manager.conflicting_ids(candidate)
-                            if conflicts and not allow_overlap:
-                                # 范围被在生效干预占用：保持待确认，可稍后再试。
-                                record.update({
-                                    "outcome": "deferred",
-                                    "reason": "scope_contention",
-                                    "conflicting_intervention_ids": conflicts,
-                                })
-                            else:
-                                manager.start(candidate, at_ms)
-                                spent_cost += suggestion["cost"]
-                                spent_risk += suggestion["risk"]
-                                intervention_count += 1
-                                suggestion["status"] = "effective"
-                                suggestion["effective_at_ms"] = at_ms
-                                if candidate.end_ms is not None:
-                                    push(candidate.end_ms, 1, "inject_end",
-                                         {"id": candidate.id})
-                                    scheduled_ends.append(candidate.end_ms)
-                                else:
-                                    active_open_effect_ids.add(candidate.id)
-                                record.update({
-                                    "outcome": "confirmed",
-                                    "effective_at_ms": at_ms,
-                                    "budget_after": {
-                                        "cost": spent_cost,
-                                        "risk": spent_risk,
-                                        "interventions": intervention_count,
-                                    },
-                                })
+                        record.update({"outcome": "rejected",
+                                       "reason": check_reason,
+                                       "precheck": snapshot})
+                    else:
+                        apply_member(suggestion, candidate, at_ms)
+                        record.update({
+                            "outcome": "confirmed",
+                            "effective_at_ms": at_ms,
+                            "precheck": snapshot,
+                            "budget_after": {
+                                "cost": spent_cost,
+                                "risk": spent_risk,
+                                "interventions": intervention_count,
+                            },
+                        })
                 elif action == "abandon":
                     if suggestion["status"] != "pending":
                         record.update({"outcome": "rejected",
@@ -365,7 +572,7 @@ class AdaptiveEngine:
                 else:
                     record.update({"outcome": "ignored",
                                    "reason": "unknown_action"})
-                if suggestion is not None:
+                if record is not None and suggestion is not None:
                     suggestion["events"].append(record)
                 schedule_finish_if_complete()
             elif kind == "decision":
@@ -410,7 +617,7 @@ class AdaptiveEngine:
             raise RuntimeError("演练结束后仍有故障未恢复")
         expire_pending(horizon_ms if horizon_ms is not None else 0)
         return (observations, decisions, stopped, stop_reason, manager.history,
-                suggestions)
+                suggestions, bundle_runs)
 
     def _decide(self, scenario, thresholds, observations, decision_index, at_ms,
                 horizon_ms, branch_id, escalated_failures, spent_cost, spent_risk,

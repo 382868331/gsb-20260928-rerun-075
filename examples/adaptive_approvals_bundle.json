@@ -1,0 +1,4 @@
+[
+  {"at_ms": 120, "action": "confirm_bundle",
+   "suggestion_ids": ["root:d0:degraded", "root:d1:degraded"], "mode": "all"}
+]

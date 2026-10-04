@@ -50,6 +50,10 @@ def _print_adaptive_summary(result: dict) -> None:
                     counts.get(suggestion["status"], 0) + 1
             detail = ", ".join(f"{k}:{v}" for k, v in sorted(counts.items()))
             print(f"  建议 {len(suggestions)} 条（{detail}）")
+        for bundle in branch.get("bundles", []):
+            print(f"  组合 @{bundle['at_ms']}ms [{bundle['mode']}] "
+                  f"{bundle['status']}: 生效 {len(bundle.get('effective_suggestion_ids', []))}"
+                  f"/{len(bundle['suggestion_ids'])}")
 
 
 def main(argv: list[str] | None = None) -> int:

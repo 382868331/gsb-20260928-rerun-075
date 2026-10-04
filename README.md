@@ -34,6 +34,17 @@
   确认被暂缓（`scope_contention`），须等前一项结束或撤回后重试。放弃未生效建议
   不改写历史观察；撤回已生效干预按原收尾约定撤销，并记录
   `affected_observation_ids`。未获批准的建议不会出现在 `fault_events` 中。
+- **相互依赖建议的组合批准**：审批事件可用 `confirm_bundle` 一次性确认一组建议，
+  并显式给出 `suggestion_ids` 与 `mode`：`all` 表示全部条件同时满足才允许执行
+  （任一成员在执行前复核中失效——过期、已非 pending、范围被占用或组合预算不足
+  ——则整组不执行，且**针对旧条件的整组确认不会被应用到变化后的剩余建议**，
+  失效成员也不会被自动替换成其他动作）；`partial` 表示允许只执行仍通过复核的成员，
+  失效成员被跳过并记录原因。`abandon_bundle` 放弃整组尚未生效的成员。
+  执行前对每名成员复核**有效期、影响范围与组合预算**并保存 `precheck` 快照；
+  partial 模式执行途中若预算/风险停止触发，已生效成员的事实保留，组合状态记为
+  `partially_effective`，不会整体记成未执行。每条建议保留决策依据观察 `basis`、
+  人工确认 `events` 与执行前复核；放弃组合与重新确认组合可作为两个独立分支比较，
+  结果随报告保存并可重放（见报告中的 `bundles[]` 与 `tests/test_bundles.py`）。
 
 ## 目录结构
 
@@ -60,6 +71,10 @@
   --thresholds examples/adaptive_approval_thresholds.json \
   --approvals examples/adaptive_approvals_root.json \
   -o /tmp/adaptive_approval.json
+.venv/bin/python -m chaos_platform adaptive-run examples/adaptive_approval.json \
+  --thresholds examples/adaptive_approval_thresholds.json \
+  --approvals examples/adaptive_approvals_bundle.json \
+  -o /tmp/adaptive_bundle.json
 .venv/bin/python -m chaos_platform replay /tmp/adaptive.json
 .venv/bin/python -m pytest -q
 ```

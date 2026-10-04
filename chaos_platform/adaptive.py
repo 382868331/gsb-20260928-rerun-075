@@ -307,44 +307,102 @@ class AdaptiveEngine:
                 run["reject_reason"] = "unknown_mode"
                 bundle_runs.append(run)
                 return "unknown_mode"
-            # 执行前复核：对全部成员检查有效期、状态、范围与组合预算。
-            checks = []
-            started_specs = []
-            projected_cost = spent_cost
-            projected_risk = spent_risk
-            projected_count = intervention_count
+            # 逐项执行前复核：每名成员的预算快照必须取自其前序成员执行后
+            # 的真实余额，而不是组合开始时的同一份快照。
             max_count = limits.get("max_interventions")
             max_cost = limits.get("max_cost")
             max_risk = limits.get("max_risk")
-            for member in ordered:
+
+            def budget_reason(proj_cost, proj_risk, proj_count, member):
+                if (max_count is not None
+                        and proj_count + 1 > int(max_count)):
+                    return "max_interventions_reached"
+                if (max_cost is not None and proj_cost
+                        + member["cost"] > float(max_cost)):
+                    return "budget_exhausted"
+                if (max_risk is not None and proj_risk
+                        + member["risk"] > float(max_risk)):
+                    return "risk_limit_reached"
+                return None
+
+            def precheck_member(member, at_ms, proj_cost, proj_risk,
+                                proj_count, bundle_active_ids):
+                """复核单个成员；预算快照反映该成员执行前的实际余额。"""
                 snapshot = precheck_snapshot(member, at_ms)
+                snapshot["budget_before"] = {
+                    "cost": proj_cost,
+                    "risk": proj_risk,
+                    "interventions": proj_count,
+                }
                 reason, conflicts, candidate = validate_member(
                     member, at_ms)
-                budget_ok = True
-                budget_reason = None
+                # 同一组合内共同批准的成员互不占范围。
+                conflicts = [cid for cid in conflicts
+                             if cid not in bundle_active_ids]
+                if reason == "scope_contention" and not conflicts:
+                    reason = None
+                if reason is None and conflicts and not allow_overlap:
+                    reason = "scope_contention"
                 if reason is None:
-                    if (max_count is not None
-                            and projected_count + 1 > int(max_count)):
-                        budget_ok, budget_reason = False, "max_interventions_reached"
-                    elif (max_cost is not None and projected_cost
-                          + member["cost"] > float(max_cost)):
-                        budget_ok, budget_reason = False, "budget_exhausted"
-                    elif (max_risk is not None and projected_risk
-                          + member["risk"] > float(max_risk)):
-                        budget_ok, budget_reason = False, "risk_limit_reached"
-                checks.append({
+                    reason = budget_reason(
+                        proj_cost, proj_risk, proj_count, member)
+                return {
                     "member": member,
                     "snapshot": snapshot,
-                    "reason": budget_reason if (reason is None and not budget_ok)
-                    else reason,
-                    "conflicts": conflicts,
+                    "reason": reason,
+                    "conflicts": sorted(set(conflicts)),
                     "candidate": candidate,
-                })
-                if reason is None and budget_ok:
-                    started_specs.append(build_candidate(member, at_ms))
-                    projected_cost += member["cost"]
-                    projected_risk += member["risk"]
-                    projected_count += 1
+                    "will_apply": False,
+                }
+
+            checks = []
+            if mode == "all":
+                # all：先对全部成员做不落地的组合整体投影复核，任一失败
+                # 则整组拒绝；快照仍按逐项投影的执行前余额保存。
+                projected_cost = spent_cost
+                projected_risk = spent_risk
+                projected_count = intervention_count
+                for member in ordered:
+                    check = precheck_member(
+                        member, at_ms, projected_cost, projected_risk,
+                        projected_count, set())
+                    checks.append(check)
+                    if check["reason"] is None:
+                        projected_cost += member["cost"]
+                        projected_risk += member["risk"]
+                        projected_count += 1
+                if not any(c["reason"] is not None for c in checks):
+                    for check in checks:
+                        check["will_apply"] = True
+            else:
+                # partial：逐项复核并立即落地；前序成员生效后，后续成员的
+                # 快照、范围占用与预算/风险停止均按实际状态重新读取。
+                bundle_active_ids: set[str] = set()
+                for member in ordered:
+                    if stopped:
+                        # 前序成员已触发预算/风险停止，后续成员按实际状态
+                        # 复核时直接拒绝，不再落地（失效成员不替换）。
+                        check = precheck_member(
+                            member, at_ms, spent_cost, spent_risk,
+                            intervention_count, bundle_active_ids)
+                        check["reason"] = "stop_condition_active"
+                        checks.append(check)
+                        continue
+                    check = precheck_member(
+                        member, at_ms, spent_cost, spent_risk,
+                        intervention_count, bundle_active_ids)
+                    checks.append(check)
+                    if check["reason"] is None:
+                        check["will_apply"] = True
+                        apply_member(member, check["candidate"], at_ms)
+                        bundle_active_ids.add(member["id"])
+                    elif check["reason"] in ("max_interventions_reached",
+                                              "budget_exhausted",
+                                              "risk_limit_reached"):
+                        # 预算类失败立即触发停止，后续成员不再执行。
+                        stopped = True
+                        stop_reason = check["reason"]
+
             any_blocked = any(c["reason"] is not None for c in checks)
             effective_ids = []
             rejected_ids = []
@@ -363,7 +421,7 @@ class AdaptiveEngine:
                     "suggestion_id": member["id"],
                     "precheck": check["snapshot"],
                 }
-                blocked_by_mode = (mode == "all" and any_blocked)
+                blocked_by_mode = not check["will_apply"] and mode == "all" and any_blocked
                 if blocked_by_mode:
                     member_record.update({
                         "outcome": "rejected",
@@ -383,14 +441,9 @@ class AdaptiveEngine:
                     if check["reason"] == "scope_contention":
                         member_record["conflicting_intervention_ids"] = check[
                             "conflicts"]
-                    if check["reason"] in ("max_interventions_reached",
-                                            "budget_exhausted",
-                                            "risk_limit_reached"):
-                        # 预算类失败触发停止，后续成员不再执行（失效不替换）。
-                        stopped = True
-                        stop_reason = check["reason"]
                 else:
-                    apply_member(member, check["candidate"], at_ms)
+                    if mode == "all":
+                        apply_member(member, check["candidate"], at_ms)
                     effective_ids.append(member["id"])
                     member_record.update({
                         "outcome": "confirmed",

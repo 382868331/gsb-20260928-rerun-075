@@ -1,6 +1,8 @@
 """组合批准（bundle）生命周期测试。"""
 from pathlib import Path
 
+import pytest
+
 from chaos_platform import (
     ExperimentRunner,
     RequestSpec,
@@ -37,6 +39,95 @@ def _run_bundle(events, **kwargs):
 
 
 B_IDS = ["root:d0:failed", "root:d1:failed"]
+
+
+def _three_item_scenario(limits=None):
+    policy = {
+        "decision_at_ms": [100, 110, 150],
+        "limits": limits or {},
+        "approval": {"required": True,
+                     "expires_after_ms": 400,
+                     "allow_overlap": False},
+        "actions": {"failed": {
+            "type": "interruption", "target": "inventory",
+            "duration_ms": 100, "params": {}, "cost": 1, "risk": 1}},
+    }
+    return Scenario(
+        name="bundle3", seed=7,
+        requests=[RequestSpec(50, {"i": 0}), RequestSpec(90, {"i": 1}),
+                  RequestSpec(130, {"i": 2})],
+        adaptive_policy=policy)
+
+
+B3_IDS = ["root:d0:failed", "root:d1:failed", "root:d2:failed"]
+
+
+@pytest.mark.parametrize("limit_name,reason", [
+    ("max_cost", "budget_exhausted"),
+    ("max_risk", "risk_limit_reached"),
+])
+def test_bundle_partial_per_member_precheck_tracks_actual_spend(limit_name,
+                                                                reason):
+    # 三项组合、每项成本/风险 1、总预算 2：第一、二项生效，第三项被拒绝。
+    # 每名成员的 precheck 必须反映其执行前的真实支出（0、1、2），
+    # 而不是复用组合开始时的同一份快照。
+    scenario = _three_item_scenario(limits={limit_name: 2})
+    branch = ExperimentRunner(_FailingChain()).run_adaptive_branch(
+        scenario, dict(_APPROVAL_THRESHOLDS), approvals=[
+            {"at_ms": 200, "action": "confirm_bundle",
+             "suggestion_ids": B3_IDS, "mode": "partial"}])
+    run = branch["bundles"][0]
+    assert run["status"] == "partially_effective"
+    assert run["effective_suggestion_ids"] == B3_IDS[:2]
+    members = {m["suggestion_id"]: m for m in run["members"]}
+    before = {sid: members[sid]["precheck"]["budget_before"]
+              for sid in B3_IDS}
+    key = "cost" if limit_name == "max_cost" else "risk"
+    assert before[B3_IDS[0]][key] == 0.0
+    assert before[B3_IDS[1]][key] == 1.0
+    assert before[B3_IDS[2]][key] == 2.0
+    assert before[B3_IDS[0]]["interventions"] == 0
+    assert before[B3_IDS[1]]["interventions"] == 1
+    assert before[B3_IDS[2]]["interventions"] == 2
+    third = members[B3_IDS[2]]
+    assert third["outcome"] == "rejected"
+    assert third["reason"] == reason
+    # 已执行事实与最终支出保留。
+    assert run["budget_after"][key] == 2.0
+    assert run["budget_after"]["interventions"] == 2
+    assert branch["stopped"] is True
+    assert branch["stop_reason"] == reason
+    starts = [e["id"] for e in branch["fault_events"]
+              if e["event"] == "inject_start"]
+    assert starts == B3_IDS[:2]
+    statuses = {s["id"]: s["status"] for s in branch["suggestions"]}
+    assert statuses[B3_IDS[0]] == "effective"
+    assert statuses[B3_IDS[1]] == "effective"
+    assert statuses[B3_IDS[2]] == "pending"
+
+
+def test_bundle_partial_budget_snapshot_survives_save_and_repeat_reads(
+        tmp_path: Path):
+    # 保存/重载与重复读取：逐项 precheck、已执行事实与最终支出保持一致，
+    # 且从保存输入重放得到相同的组合审计。
+    scenario = _three_item_scenario(limits={"max_cost": 2})
+    runner = ExperimentRunner(_FailingChain())
+    branch = runner.run_adaptive_branch(
+        scenario, dict(_APPROVAL_THRESHOLDS), approvals=[
+            {"at_ms": 200, "action": "confirm_bundle",
+             "suggestion_ids": B3_IDS, "mode": "partial"}])
+    experiment = {"scenario_name": scenario.name, "seed": scenario.seed,
+                  "branches": [branch]}
+    path = tmp_path / "bundle3.json"
+    save_adaptive_run(experiment, scenario, path)
+    first_read = load_run(path)["result"]["branches"][0]["bundles"]
+    second_read = load_run(path)["result"]["branches"][0]["bundles"]
+    assert first_read == second_read == branch["bundles"]
+    saved = load_run(path)
+    replayed = runner.run_adaptive_branch(
+        scenario_from_dict(saved["scenario"]), dict(_APPROVAL_THRESHOLDS),
+        approvals=saved["result"]["branches"][0]["approvals"])
+    assert replayed["bundles"] == branch["bundles"]
 
 
 def test_bundle_all_mode_late_confirm_is_all_or_nothing():

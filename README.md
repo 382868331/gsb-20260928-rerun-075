@@ -45,6 +45,20 @@
   `partially_effective`，不会整体记成未执行。每条建议保留决策依据观察 `basis`、
   人工确认 `events` 与执行前复核；放弃组合与重新确认组合可作为两个独立分支比较，
   结果随报告保存并可重放（见报告中的 `bundles[]` 与 `tests/test_bundles.py`）。
+- **变化条件下的剩余方案选择**：组合批准事件可携带组合级 `budget`
+  （`max_cost`/`max_risk`）与 `plan`。执行每一项前按最新状态复核剩余候选的
+  有效期、证据、互斥（`mutex_group`）与全局/组合预算，投影后续成员的支出；
+  `plan_comparison` 同时推演 **保持原顺序（original_order）** 与
+  **低风险替代项优先（lowest_risk）** 两种明确方案并保存，实际执行选定方案。
+  已执行成员的成本与影响永久计入 `committed`，不因后续失败、撤回或重排而归零；
+  替代项只能是事件列出的、各自具备独立有效批准的建议（`approval_basis`），
+  过期许可不能沿用。多项干预共享风险来源（`risk_sources`）时按
+  **并集聚合（shared_source_union）** 记账——同一来源只计一次，既不朴素相加
+  也不重复折扣，聚合方式与 `naive_sum`/`aggregated` 一并保存。组合预算突增、
+  证据缺失或 `manual_stop` 人工停止时保留已执行集合与 `remaining` 未执行原因；
+  `resume_bundle` 重开时逐项重新核对剩余部分（人工停止可重开，预算/风险停止
+  不可绕过），重复完成通知记为 `already_effective`，不重复执行、不重复计费
+  （见 `tests/test_remaining_plans.py`）。
 
 ## 目录结构
 

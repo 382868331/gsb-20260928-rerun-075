@@ -53,7 +53,10 @@ def _print_adaptive_summary(result: dict) -> None:
         for bundle in branch.get("bundles", []):
             print(f"  组合 @{bundle['at_ms']}ms [{bundle['mode']}] "
                   f"{bundle['status']}: 生效 {len(bundle.get('effective_suggestion_ids', []))}"
-                  f"/{len(bundle['suggestion_ids'])}")
+                  f"/{len(bundle['suggestion_ids'])}"
+                  + (f" 方案 {bundle['plan']}" if bundle.get("plan") else "")
+                  + (f" 剩余 {len(bundle['remaining'])}"
+                     if bundle.get("remaining") else ""))
 
 
 def main(argv: list[str] | None = None) -> int:

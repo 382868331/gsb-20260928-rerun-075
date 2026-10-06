@@ -239,11 +239,11 @@ class AdaptiveEngine:
                 return "scope_contention", sorted(set(conflicts)), candidate
             return None, [], candidate
 
-        def apply_member(suggestion, candidate, at_ms):
+        def apply_member(suggestion, candidate, at_ms, risk_charge=None):
             nonlocal spent_cost, spent_risk, intervention_count
             manager.start(candidate, at_ms)
             spent_cost += suggestion["cost"]
-            spent_risk += suggestion["risk"]
+            spent_risk += suggestion["risk"] if risk_charge is None else risk_charge
             intervention_count += 1
             suggestion["status"] = "effective"
             suggestion["effective_at_ms"] = at_ms
@@ -253,29 +253,78 @@ class AdaptiveEngine:
             else:
                 active_open_effect_ids.add(candidate.id)
 
-        def handle_bundle_event(event, action, at_ms):
-            """处理组合批准/放弃，返回组合不可解析时的忽略原因或 None。
+        def member_risk_sources(member):
+            return dict(member.get("risk_sources") or {})
 
-            组合确认针对事件中显式列出的成员快照；失效成员不会被自动替换为
-            其他动作。all 模式任一成员复核失败则整组不执行；partial 模式
-            只执行通过复核的成员，已生效事实保留。
+        def incremental_risk(member, seen_sources):
+            """共享风险来源按并集记账：同一来源只计一次，不朴素相加。"""
+            sources = member_risk_sources(member)
+            if not sources:
+                return member["risk"]
+            return sum(amount for source, amount in sources.items()
+                       if source not in seen_sources)
+
+        def handle_bundle_event(event, action, at_ms):
+            """处理组合批准/放弃/重开，返回组合不可解析时的忽略原因或 None。
+
+            批准事件可携带组合级 budget（max_cost/max_risk）与 plan
+            （original_order / lowest_risk）。执行每一项前按最新状态复核
+            剩余候选的有效期、证据、互斥与预算；已生效成员的成本与影响
+            永久计入 committed，不因后续失败、撤回或重排而归零。替代项
+            只能来自事件列出的、各自具备独立有效批准的建议，过期许可
+            不能沿用。all 模式任一成员复核失败则整组不执行；partial
+            模式只执行通过复核的成员，已生效事实保留。
             """
             nonlocal stopped, stop_reason
-            raw_ids = event.get("suggestion_ids")
+            max_count = limits.get("max_interventions")
+            max_cost = limits.get("max_cost")
+            max_risk = limits.get("max_risk")
+            by_id = {s["id"]: s for s in suggestions}
+            resumed_from = None
+            source_run = None
+            carried_committed: list[dict] = []
+            if action == "resume_bundle":
+                source_id = event.get("bundle_id")
+                source_run = next((r for r in bundle_runs
+                                   if r["id"] == source_id), None)
+                if source_run is None:
+                    return "unknown_bundle"
+                raw_ids = [m["suggestion_id"]
+                           for m in source_run.get("remaining", [])]
+                if not raw_ids:
+                    return "no_remaining_members"
+                resumed_from = source_id
+                carried_committed = list(source_run.get("committed", []))
+                # 人工停止可通过重开继续；其余停止条件不可绕过。
+                if stopped and stop_reason == "manual_stop":
+                    stopped = False
+                    stop_reason = None
+            else:
+                raw_ids = event.get("suggestion_ids")
             if not raw_ids:
                 return "missing_suggestion_ids"
-            by_id = {s["id"]: s for s in suggestions}
             unknown = [sid for sid in raw_ids if sid not in by_id]
             if unknown:
                 return f"unknown_suggestion:{unknown[0]}"
             if len(set(raw_ids)) != len(raw_ids):
                 return "duplicate_suggestion_ids"
-            mode = event.get("mode", "all")
+            mode = event.get("mode",
+                             "partial" if action == "resume_bundle" else "all")
+            plan_name = event.get("plan", "original_order")
+            budget_cfg = event.get("budget")
+            if budget_cfg is None and source_run is not None:
+                budget_cfg = source_run.get("budget")
+            budget_cfg = dict(budget_cfg or {})
+            bundle_max_cost = budget_cfg.get("max_cost")
+            bundle_max_risk = budget_cfg.get("max_risk")
             run = {
                 "id": f"bundle@{at_ms}:{len(bundle_runs)}",
                 "at_ms": at_ms,
                 "action": action,
                 "mode": mode,
+                "plan": plan_name,
+                "budget": dict(budget_cfg),
+                "resumed_from": resumed_from,
                 "suggestion_ids": list(raw_ids),
                 "members": [],
             }
@@ -307,122 +356,322 @@ class AdaptiveEngine:
                 run["reject_reason"] = "unknown_mode"
                 bundle_runs.append(run)
                 return "unknown_mode"
-            # 执行前复核：对全部成员检查有效期、状态、范围与组合预算。
+            if plan_name not in ("original_order", "lowest_risk"):
+                run["status"] = "rejected"
+                run["reject_reason"] = "unknown_plan"
+                bundle_runs.append(run)
+                return "unknown_plan"
+
+            carried_cost = sum(c["cost"] for c in carried_committed)
+            carried_risk = sum(c["risk"] for c in carried_committed)
+            carried_sources = {src for c in carried_committed
+                               for src in c.get("risk_sources", {})}
+            carried_groups = {c["mutex_group"] for c in carried_committed
+                              if c.get("mutex_group")}
+            effective_groups = {s["mutex_group"] for s in suggestions
+                                if s["status"] == "effective"
+                                and s.get("mutex_group")}
+
+            def plan_block_reason(member, seen_sources, groups, proj,
+                                  proj_bundle_cost, proj_bundle_risk):
+                """剩余候选复核：状态、有效期、证据、互斥、全局与组合预算。"""
+                if member["status"] == "effective":
+                    return "already_effective"
+                if member["status"] != "pending":
+                    return f"suggestion_{member['status']}"
+                if (member["valid_until_ms"] is not None
+                        and at_ms > member["valid_until_ms"]):
+                    return "suggestion_expired"
+                if not member["basis"].get("window_observation_ids"):
+                    return "missing_evidence"
+                group = member.get("mutex_group")
+                if group and group in groups:
+                    return "mutex_conflict"
+                if (max_count is not None
+                        and proj["interventions"] + 1 > int(max_count)):
+                    return "max_interventions_reached"
+                if (max_cost is not None and proj["cost"]
+                        + member["cost"] > float(max_cost)):
+                    return "budget_exhausted"
+                inc = incremental_risk(member, seen_sources)
+                if (max_risk is not None and proj["risk"]
+                        + inc > float(max_risk)):
+                    return "risk_limit_reached"
+                if (bundle_max_cost is not None and proj_bundle_cost
+                        + member["cost"] > float(bundle_max_cost)):
+                    return "bundle_budget_exceeded"
+                if (bundle_max_risk is not None and proj_bundle_risk
+                        + inc > float(bundle_max_risk)):
+                    return "bundle_budget_exceeded"
+                return None
+
+            def simulate_plan(name, plan_members):
+                """对同一批剩余候选推演一个明确方案，不改动任何状态。"""
+                seen = set(carried_sources)
+                groups = set(carried_groups) | set(effective_groups)
+                proj = {"cost": spent_cost, "risk": spent_risk,
+                        "interventions": intervention_count}
+                proj_bundle_cost = carried_cost
+                proj_bundle_risk = carried_risk
+                entries = []
+                for member in plan_members:
+                    reason = plan_block_reason(
+                        member, seen, groups, proj,
+                        proj_bundle_cost, proj_bundle_risk)
+                    entry = {"suggestion_id": member["id"],
+                             "outcome": reason or "executable"}
+                    if reason:
+                        entry["reason"] = reason
+                    else:
+                        inc = incremental_risk(member, seen)
+                        entry["incremental_risk"] = inc
+                        seen.update(member_risk_sources(member))
+                        if member.get("mutex_group"):
+                            groups.add(member["mutex_group"])
+                        proj["cost"] += member["cost"]
+                        proj["risk"] += inc
+                        proj["interventions"] += 1
+                        proj_bundle_cost += member["cost"]
+                        proj_bundle_risk += inc
+                    entries.append(entry)
+                return {
+                    "name": name,
+                    "order": [m["id"] for m in plan_members],
+                    "entries": entries,
+                    "projected": {
+                        "cost": proj["cost"],
+                        "risk": proj["risk"],
+                        "interventions": proj["interventions"],
+                        "bundle_cost": proj_bundle_cost,
+                        "bundle_risk": proj_bundle_risk,
+                    },
+                }
+
+            def risk_then_original(member):
+                return (member["risk"], raw_ids.index(member["id"]))
+
+            low_risk_order = sorted(ordered, key=risk_then_original)
+            # 两种明确方案都完整推演并保存，实际执行选定的方案。
+            run["plan_comparison"] = {
+                "plans": [simulate_plan("original_order", ordered),
+                          simulate_plan("lowest_risk", low_risk_order)],
+                "selected": plan_name,
+            }
+            plan_order = (low_risk_order if plan_name == "lowest_risk"
+                          else list(ordered))
+
+            executed_sources = set(carried_sources)
+            executed_groups = set(carried_groups) | set(effective_groups)
+            bundle_cost = carried_cost
+            bundle_risk = carried_risk
+            committed_new: list[dict] = []
             checks = []
-            started_specs = []
-            projected_cost = spent_cost
-            projected_risk = spent_risk
-            projected_count = intervention_count
-            max_count = limits.get("max_interventions")
-            max_cost = limits.get("max_cost")
-            max_risk = limits.get("max_risk")
-            for member in ordered:
+            proj_cost = spent_cost
+            proj_risk = spent_risk
+            proj_count = intervention_count
+            proj_bundle_cost = bundle_cost
+            proj_bundle_risk = bundle_risk
+            proj_sources = set(executed_sources)
+            proj_groups = set(executed_groups)
+            for member in plan_order:
                 snapshot = precheck_snapshot(member, at_ms)
-                reason, conflicts, candidate = validate_member(
-                    member, at_ms)
-                budget_ok = True
-                budget_reason = None
+                if member["status"] == "effective":
+                    # 重复完成通知：已生效成员不重复执行、不重复计费。
+                    checks.append({"member": member, "snapshot": snapshot,
+                                   "reason": "already_effective",
+                                   "conflicts": [], "candidate": None})
+                    continue
+                reason, conflicts, candidate = validate_member(member, at_ms)
+                if reason in ("max_interventions_reached",
+                              "budget_exhausted", "risk_limit_reached"):
+                    # 预算类结论按组合内投影支出重新判断（见下）。
+                    reason, conflicts = None, []
+                    candidate = build_candidate(member, at_ms)
+                inc = incremental_risk(member, proj_sources)
                 if reason is None:
                     if (max_count is not None
-                            and projected_count + 1 > int(max_count)):
-                        budget_ok, budget_reason = False, "max_interventions_reached"
-                    elif (max_cost is not None and projected_cost
+                            and proj_count + 1 > int(max_count)):
+                        reason = "max_interventions_reached"
+                    elif (max_cost is not None and proj_cost
                           + member["cost"] > float(max_cost)):
-                        budget_ok, budget_reason = False, "budget_exhausted"
-                    elif (max_risk is not None and projected_risk
-                          + member["risk"] > float(max_risk)):
-                        budget_ok, budget_reason = False, "risk_limit_reached"
-                checks.append({
-                    "member": member,
-                    "snapshot": snapshot,
-                    "reason": budget_reason if (reason is None and not budget_ok)
-                    else reason,
-                    "conflicts": conflicts,
-                    "candidate": candidate,
-                })
-                if reason is None and budget_ok:
-                    started_specs.append(build_candidate(member, at_ms))
-                    projected_cost += member["cost"]
-                    projected_risk += member["risk"]
-                    projected_count += 1
-            any_blocked = any(c["reason"] is not None for c in checks)
+                        reason = "budget_exhausted"
+                    elif (max_risk is not None and proj_risk
+                          + inc > float(max_risk)):
+                        reason = "risk_limit_reached"
+                    elif not member["basis"].get("window_observation_ids"):
+                        reason = "missing_evidence"
+                    elif (member.get("mutex_group")
+                          and member["mutex_group"] in proj_groups):
+                        reason = "mutex_conflict"
+                    elif (bundle_max_cost is not None and proj_bundle_cost
+                          + member["cost"] > float(bundle_max_cost)):
+                        reason = "bundle_budget_exceeded"
+                    elif (bundle_max_risk is not None and proj_bundle_risk
+                          + inc > float(bundle_max_risk)):
+                        reason = "bundle_budget_exceeded"
+                if reason is None:
+                    # 投影：后续成员按本成员已执行后的支出复核。
+                    proj_count += 1
+                    proj_cost += member["cost"]
+                    proj_risk += inc
+                    proj_bundle_cost += member["cost"]
+                    proj_bundle_risk += inc
+                    proj_sources.update(member_risk_sources(member))
+                    if member.get("mutex_group"):
+                        proj_groups.add(member["mutex_group"])
+                checks.append({"member": member, "snapshot": snapshot,
+                               "reason": reason, "conflicts": conflicts,
+                               "candidate": candidate})
+            any_blocked = any(c["reason"] not in (None, "already_effective")
+                              for c in checks)
+            blocked_by_mode = mode == "all" and any_blocked
             effective_ids = []
             rejected_ids = []
-            if mode == "all" and any_blocked:
-                run["status"] = "rejected"
-                run["reject_reason"] = "precheck_failed"
-            else:
-                run["status"] = "partially_effective" if any_blocked else "effective"
             for check in checks:
                 member = check["member"]
-                if not (mode == "all" and any_blocked):
-                    # 逐项复核：快照与预算按该成员实际执行前的支出重新计算，
-                    # 不能复用组合开始时的快照。
+                if not blocked_by_mode:
+                    # 逐项复核：快照与预算按该成员实际执行前的最新支出
+                    # 重新计算，不能复用组合开始时的快照。
                     check["snapshot"] = precheck_snapshot(member, at_ms)
-                    if check["reason"] is None:
-                        if (max_count is not None
-                                and intervention_count + 1 > int(max_count)):
-                            check["reason"] = "max_interventions_reached"
-                        elif (max_cost is not None and spent_cost
-                              + member["cost"] > float(max_cost)):
-                            check["reason"] = "budget_exhausted"
-                        elif (max_risk is not None and spent_risk
-                              + member["risk"] > float(max_risk)):
-                            check["reason"] = "risk_limit_reached"
+                if not blocked_by_mode and check["reason"] is None:
+                    inc = incremental_risk(member, executed_sources)
+                    if (max_count is not None
+                            and intervention_count + 1 > int(max_count)):
+                        check["reason"] = "max_interventions_reached"
+                    elif (max_cost is not None and spent_cost
+                          + member["cost"] > float(max_cost)):
+                        check["reason"] = "budget_exhausted"
+                    elif (max_risk is not None and spent_risk
+                          + inc > float(max_risk)):
+                        check["reason"] = "risk_limit_reached"
+                    elif (bundle_max_cost is not None and bundle_cost
+                          + member["cost"] > float(bundle_max_cost)):
+                        check["reason"] = "bundle_budget_exceeded"
+                    elif (bundle_max_risk is not None and bundle_risk
+                          + inc > float(bundle_max_risk)):
+                        check["reason"] = "bundle_budget_exceeded"
                 member_record = {
                     "at_ms": at_ms,
-                    "action": "confirm_bundle",
+                    "action": action,
                     "bundle_id": run["id"],
                     "mode": mode,
+                    "plan": plan_name,
                     "suggestion_id": member["id"],
                     "precheck": check["snapshot"],
+                    "approval_basis": {
+                        "suggestion_id": member["id"],
+                        "valid_until_ms": member["valid_until_ms"],
+                        "independent": True,
+                    },
+                    "bundle_budget_before": {
+                        "cost": bundle_cost,
+                        "risk": bundle_risk,
+                    },
                 }
-                blocked_by_mode = (mode == "all" and any_blocked)
-                if blocked_by_mode:
+                reason = check["reason"]
+                if reason == "already_effective":
+                    member_record["outcome"] = "already_effective"
+                elif blocked_by_mode:
                     member_record.update({
                         "outcome": "rejected",
-                        "reason": check["reason"] or "bundle_precheck_failed",
+                        "reason": reason or "bundle_precheck_failed",
                     })
                     rejected_ids.append(member["id"])
-                    if check["reason"] == "scope_contention":
+                    if reason == "scope_contention":
                         member_record["conflicting_intervention_ids"] = check[
                             "conflicts"]
-                elif check["reason"] is not None:
+                elif reason is not None:
                     member_record["outcome"] = (
-                        "deferred" if check["reason"] == "scope_contention"
+                        "deferred" if reason == "scope_contention"
                         else "rejected")
-                    member_record["reason"] = check["reason"]
+                    member_record["reason"] = reason
                     if member_record["outcome"] == "rejected":
                         rejected_ids.append(member["id"])
-                    if check["reason"] == "scope_contention":
+                    if reason == "scope_contention":
                         member_record["conflicting_intervention_ids"] = check[
                             "conflicts"]
-                    if check["reason"] in ("max_interventions_reached",
-                                            "budget_exhausted",
-                                            "risk_limit_reached"):
-                        # 预算类失败触发停止，后续成员不再执行（失效不替换）。
+                    if reason in ("max_interventions_reached",
+                                  "budget_exhausted",
+                                  "risk_limit_reached"):
+                        # 全局预算类失败触发停止，后续成员不再执行
+                        # （失效不替换）；组合级预算不足不触发全局停止，
+                        # 保留已执行集合，可经 resume_bundle 重开。
                         stopped = True
-                        stop_reason = check["reason"]
+                        stop_reason = reason
                 else:
-                    apply_member(member, check["candidate"], at_ms)
+                    inc = incremental_risk(member, executed_sources)
+                    apply_member(member, check["candidate"], at_ms,
+                                 risk_charge=inc)
+                    executed_sources.update(member_risk_sources(member))
+                    if member.get("mutex_group"):
+                        executed_groups.add(member["mutex_group"])
+                    bundle_cost += member["cost"]
+                    bundle_risk += inc
+                    # 已执行成员的成本与影响永久计入本组合，不因后续
+                    # 失败、撤回或重排而归零。
+                    committed_new.append({
+                        "suggestion_id": member["id"],
+                        "cost": member["cost"],
+                        "risk": inc,
+                        "effective_at_ms": at_ms,
+                        "risk_sources": member_risk_sources(member),
+                        "mutex_group": member.get("mutex_group"),
+                        "permanent": True,
+                    })
                     effective_ids.append(member["id"])
                     member_record.update({
                         "outcome": "confirmed",
                         "effective_at_ms": at_ms,
+                        "incremental_risk": inc,
                         "budget_after": {
                             "cost": spent_cost,
                             "risk": spent_risk,
                             "interventions": intervention_count,
                         },
+                        "bundle_budget_after": {
+                            "cost": bundle_cost,
+                            "risk": bundle_risk,
+                        },
                     })
                 member["events"].append(member_record)
                 run["members"].append(member_record)
+            run["status"] = ("rejected" if blocked_by_mode
+                             else "partially_effective" if any_blocked
+                             else "effective")
+            if blocked_by_mode:
+                run["reject_reason"] = "precheck_failed"
+            committed_all = carried_committed + committed_new
+            run["committed"] = committed_all
+            run["committed_in_run"] = [c["suggestion_id"]
+                                       for c in committed_new]
             run["effective_suggestion_ids"] = effective_ids
             run["rejected_suggestion_ids"] = rejected_ids
+            shared_sources: dict = {}
+            for committed in committed_new:
+                shared_sources.update(committed["risk_sources"])
+            run["risk_aggregation"] = {
+                # 共享来源只计一次（并集），既不朴素相加也不重复折扣。
+                "method": "shared_source_union",
+                "shared_sources": shared_sources,
+                "naive_sum": sum(by_id[c["suggestion_id"]]["risk"]
+                                 for c in committed_new),
+                "aggregated": sum(c["risk"] for c in committed_new),
+            }
+            run["remaining"] = [
+                {"suggestion_id": m["suggestion_id"], "reason": m["reason"]}
+                for m in run["members"]
+                if m["outcome"] in ("rejected", "deferred")
+                and by_id[m["suggestion_id"]]["status"] == "pending"
+            ]
+            run["resumable"] = bool(run["remaining"])
             run["budget_after"] = {
                 "cost": spent_cost,
                 "risk": spent_risk,
                 "interventions": intervention_count,
+            }
+            run["bundle_budget_after"] = {
+                "cost": bundle_cost,
+                "risk": bundle_risk,
             }
             bundle_runs.append(run)
             return None
@@ -494,6 +743,9 @@ class AdaptiveEngine:
                             "spec": self._injection_to_dict(spec),
                             "cost": float(template.get("cost", 0)),
                             "risk": float(template.get("risk", 0)),
+                            "risk_sources": dict(
+                                template.get("risk_sources") or {}),
+                            "mutex_group": template.get("mutex_group"),
                             "template": dict(template),
                             "status": "pending",
                             "events": [],
@@ -518,7 +770,8 @@ class AdaptiveEngine:
                     "action": action,
                     "suggestion_id": None if suggestion is None else suggestion["id"],
                 }
-                if action in ("confirm_bundle", "abandon_bundle"):
+                if action in ("confirm_bundle", "abandon_bundle",
+                              "resume_bundle"):
                     # 组合事件写入 bundle 审计与各成员 events，不使用单条 record。
                     ignore_reason = handle_bundle_event(event, action, at_ms)
                     if ignore_reason is not None:
@@ -527,6 +780,13 @@ class AdaptiveEngine:
                                        "suggestion_id": None})
                     else:
                         record = None
+                elif action == "manual_stop":
+                    # 人工停止：保留已执行集合与未执行原因，可经
+                    # resume_bundle 重开并逐项重新核对剩余部分。
+                    stopped = True
+                    stop_reason = "manual_stop"
+                    record.update({"outcome": "stopped",
+                                   "reason": "manual_stop"})
                 elif suggestion is None:
                     record.update({"outcome": "ignored",
                                    "reason": "unknown_suggestion"})

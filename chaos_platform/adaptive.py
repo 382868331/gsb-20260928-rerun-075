@@ -58,7 +58,7 @@ class AdaptiveEngine:
 
         control = self._run_control(scenario, branch_id)
         (treatment, decisions, stopped, stop_reason, fault_events, suggestions,
-         bundle_runs) = self._run_treatment(
+         bundle_runs, plan_runs) = self._run_treatment(
             scenario, thresholds, decision_times, horizon,
             branch_id, group_name, approvals or [])
         control_by_id = {o.request_id: o for o in control}
@@ -78,6 +78,7 @@ class AdaptiveEngine:
             "approvals": [dict(a) for a in (approvals or [])],
             "suggestions": suggestions,
             "bundles": bundle_runs,
+            "plans": plan_runs,
             "control_observations": [o.to_dict() for o in control],
             "observations": [o.to_dict() for o in treatment],
             "comparisons": comparisons,
@@ -133,6 +134,8 @@ class AdaptiveEngine:
         decisions: list[dict] = []
         suggestions: list[dict] = []
         bundle_runs: list[dict] = []
+        plan_runs: list[dict] = []
+        plans_by_id: dict[str, dict] = {}
         escalated_failures: set[int] = set()
         spent_cost = 0.0
         spent_risk = 0.0
@@ -427,6 +430,349 @@ class AdaptiveEngine:
             bundle_runs.append(run)
             return None
 
+        def aggregate_plan_risk(members):
+            """共享风险来源聚合：同一来源内取成员最大风险、跨来源求和，
+            未声明来源的成员各自独立计入。既不简单相加（把共享来源重复计费
+            而高估），也不重复折扣（把独立来源一并折减而低估），避免伪可行方案。
+            """
+            by_source: dict[str, float] = {}
+            independent = 0.0
+            for member in members:
+                sources = member.get("risk_sources") or []
+                if not sources:
+                    independent += member["risk"]
+                for source in sources:
+                    by_source[source] = max(by_source.get(source, 0.0),
+                                            member["risk"])
+            return independent + sum(by_source.values())
+
+        def project_plan(order, budget):
+            """按给定顺序模拟预算约束下的可执行集合（不改动任何状态）。"""
+            projected_cost = 0.0
+            executable: list[dict] = []
+            executable_ids: list[str] = []
+            for member in order:
+                if member["status"] != "pending":
+                    continue
+                if budget is not None:
+                    cap_cost = budget.get("cost")
+                    cap_risk = budget.get("risk")
+                    if (cap_cost is not None
+                            and projected_cost + member["cost"]
+                            > float(cap_cost)):
+                        continue
+                    if (cap_risk is not None
+                            and aggregate_plan_risk(executable + [member])
+                            > float(cap_risk)):
+                        continue
+                executable.append(member)
+                executable_ids.append(member["id"])
+                projected_cost += member["cost"]
+            return {
+                "order": [m["id"] for m in order],
+                "projected_executable_ids": executable_ids,
+                "projected_cost": projected_cost,
+                "projected_risk": aggregate_plan_risk(executable),
+            }
+
+        def update_plan_status(run):
+            if run["remaining_ids"]:
+                run["status"] = ("stopped"
+                                 if run["remaining_blocked_reason"] else "in_progress")
+            elif run["executed_suggestion_ids"]:
+                run["status"] = ("partially_effective"
+                                 if run["failed_ids"] else "effective")
+            else:
+                run["status"] = "rejected"
+
+        def plan_note_not_executed(run, suggestion_id, reason, at_ms):
+            run["not_executed"].append({
+                "suggestion_id": suggestion_id,
+                "reason": reason,
+                "at_ms": at_ms,
+            })
+
+        def plan_attempt(run, member, at_ms, substitutes, by_id, depth=0):
+            """执行前按最新状态复核单项：有效期、证据、互斥范围、全局与
+            组合预算。已生效成员视为重复完成通知，跳过且不重复计费。
+            成员不可执行时若给出替代项，替代项必须是另一条独立待批准建议
+            （独立批准依据），过期或已失效的许可不能沿用。
+            返回追加到 run["members"] 的记录。
+            """
+            nonlocal stopped, stop_reason
+            record = {
+                "at_ms": at_ms,
+                "action": run["current_action"],
+                "plan_id": run["id"],
+                "suggestion_id": member["id"],
+                "precheck": precheck_snapshot(member, at_ms),
+            }
+            run["members"].append(record)
+
+            def finish(outcome, reason=None, terminal=True, **extra):
+                record["outcome"] = outcome
+                if reason is not None:
+                    record["reason"] = reason
+                record.update(extra)
+                if terminal and member["id"] in run["remaining_ids"]:
+                    run["remaining_ids"].remove(member["id"])
+                    plan_note_not_executed(run, member["id"],
+                                           reason or outcome, at_ms)
+                if terminal and outcome == "rejected":
+                    run["failed_ids"].append(member["id"])
+                update_plan_status(run)
+                return record
+
+            def reject_with_substitute(reason, blocks_plan=False, **extra):
+                substitute_id = substitutes.get(member["id"])
+                if substitute_id is not None and depth == 0:
+                    substitute = by_id.get(substitute_id)
+                    record["substitute_suggestion_id"] = substitute_id
+                    if substitute is None:
+                        record["substitute_reason"] = "unknown_substitute"
+                    elif substitute["status"] != "pending":
+                        record["substitute_reason"] = (
+                            f"substitute_{substitute['status']}")
+                    else:
+                        finish("replaced", reason, **extra)
+                        plan_attempt(run, substitute, at_ms, substitutes,
+                                     by_id, depth + 1)
+                        if substitute["id"] not in run["executed_suggestion_ids"]:
+                            run["failed_ids"].append(member["id"])
+                        update_plan_status(run)
+                        return record
+                if blocks_plan:
+                    # 预算/证据类失败：保留已执行集合，剩余部分阻塞待重开复核。
+                    run["remaining_blocked_reason"] = reason
+                    run["stop_reason"] = reason
+                    # 阻塞而非终结：成员留在剩余集合，重开后重新核对。
+                    plan_note_not_executed(run, member["id"], reason, at_ms)
+                    return finish("rejected", reason, terminal=False, **extra)
+                return finish("rejected", reason, **extra)
+
+            if run["remaining_blocked_reason"] is not None:
+                reason = f"plan_stopped:{run['remaining_blocked_reason']}"
+                plan_note_not_executed(run, member["id"], reason, at_ms)
+                return finish("skipped", reason, terminal=False)
+            # 重复完成通知：已生效成员不重复执行、不重复计入预算。
+            if member["status"] == "effective":
+                return finish("skipped", "already_effective")
+            if member["status"] != "pending":
+                return reject_with_substitute(f"suggestion_{member['status']}")
+            if not member["basis"]["window_observation_ids"]:
+                return reject_with_substitute("missing_evidence",
+                                              blocks_plan=True)
+            budget = run.get("budget")
+            if budget is not None:
+                cap_cost = budget.get("cost")
+                cap_risk = budget.get("risk")
+                if (cap_cost is not None
+                        and run["spent"]["cost"] + member["cost"]
+                        > float(cap_cost)):
+                    return reject_with_substitute("plan_budget_exceeded",
+                                                  blocks_plan=True)
+                if (cap_risk is not None
+                        and aggregate_plan_risk(
+                            run["executed_members"] + [member])
+                        > float(cap_risk)):
+                    return reject_with_substitute("plan_budget_exceeded",
+                                                  blocks_plan=True)
+            check_reason, conflicts, candidate = validate_member(member, at_ms)
+            # 同一组合成员（含替代项）视为共同批准，互不占范围；
+            # 只与组合外的在生效干预争用。
+            co_approved = set(run["suggestion_ids"]) | set(substitutes.values())
+            conflicts = [c for c in conflicts if c not in co_approved]
+            if check_reason == "scope_contention" and not conflicts:
+                check_reason = None
+            if check_reason == "scope_contention":
+                # 互斥范围被占用：暂缓，成员保留在剩余集合中。
+                return finish("deferred", "scope_contention", terminal=False,
+                              conflicting_intervention_ids=conflicts)
+            if check_reason is not None:
+                if check_reason in ("max_interventions_reached",
+                                    "budget_exhausted",
+                                    "risk_limit_reached"):
+                    stopped = True
+                    stop_reason = check_reason
+                return reject_with_substitute(check_reason)
+            apply_member(member, candidate, at_ms)
+            run["executed_members"].append(member)
+            run["executed_suggestion_ids"].append(member["id"])
+            if member["id"] in run["remaining_ids"]:
+                run["remaining_ids"].remove(member["id"])
+            # 已执行干预的成本与影响永久计入本次组合，只增不减。
+            run["spent"]["cost"] += member["cost"]
+            run["spent"]["risk"] = aggregate_plan_risk(run["executed_members"])
+            run["budget_trajectory"].append({
+                "at_ms": at_ms,
+                "suggestion_id": member["id"],
+                "spent_cost": run["spent"]["cost"],
+                "spent_risk": run["spent"]["risk"],
+            })
+            record.update({
+                "outcome": "confirmed",
+                "effective_at_ms": at_ms,
+                "plan_spent_after": dict(run["spent"]),
+            })
+            update_plan_status(run)
+            return record
+
+        def handle_plan_event(event, action, at_ms):
+            """剩余方案选择：批准时给定组合预算，执行每一项前按最新状态复核
+            剩余候选；显式比较“保持原顺序”与“低风险优先”两种方案。
+            """
+            nonlocal stopped, stop_reason
+            by_id = {s["id"]: s for s in suggestions}
+            if action == "plan_bundle":
+                raw_ids = event.get("suggestion_ids")
+                if not raw_ids:
+                    return "missing_suggestion_ids"
+                unknown = [sid for sid in raw_ids if sid not in by_id]
+                if unknown:
+                    return f"unknown_suggestion:{unknown[0]}"
+                if len(set(raw_ids)) != len(raw_ids):
+                    return "duplicate_suggestion_ids"
+                strategy = event.get("strategy", "original_order")
+                if strategy not in ("original_order", "lower_risk_first"):
+                    return "unknown_strategy"
+                plan_id = event.get("plan_id") or f"plan@{at_ms}:{len(plan_runs)}"
+                if plan_id in plans_by_id:
+                    return "duplicate_plan_id"
+                ordered = [by_id[sid] for sid in raw_ids]
+                lower_risk = sorted(
+                    ordered, key=lambda s: (s["risk"], s["cost"], s["id"]))
+                budget = event.get("budget")
+                budget = None if budget is None else {
+                    "cost": (None if budget.get("cost") is None
+                             else float(budget["cost"])),
+                    "risk": (None if budget.get("risk") is None
+                             else float(budget["risk"])),
+                }
+                plans = {
+                    "original_order": list(raw_ids),
+                    "lower_risk_first": [m["id"] for m in lower_risk],
+                }
+                run = {
+                    "id": plan_id,
+                    "at_ms": at_ms,
+                    "action": "plan_bundle",
+                    "strategy": strategy,
+                    "budget": budget,
+                    "risk_aggregation":
+                        "max_within_shared_source_sum_across_sources",
+                    "suggestion_ids": list(raw_ids),
+                    "plans": plans,
+                    "plan_comparison": {
+                        "original_order": project_plan(ordered, budget),
+                        "lower_risk_first": project_plan(lower_risk, budget),
+                    },
+                    "members": [],
+                    "events": [{"at_ms": at_ms, "action": "plan_bundle",
+                                "strategy": strategy, "budget": budget}],
+                    "executed_members": [],
+                    "executed_suggestion_ids": [],
+                    "failed_ids": [],
+                    "not_executed": [],
+                    "remaining_ids": list(raw_ids),
+                    "remaining_blocked_reason": None,
+                    "spent": {"cost": 0.0, "risk": 0.0},
+                    "spent_permanent": True,
+                    "budget_trajectory": [],
+                    "status": "in_progress",
+                    "stop_reason": None,
+                    "current_action": "plan_bundle",
+                }
+                plan_runs.append(run)
+                plans_by_id[plan_id] = run
+                substitutes = event.get("substitutes") or {}
+                execution_order = ordered if strategy == "original_order" else lower_risk
+                for member in execution_order:
+                    plan_attempt(run, member, at_ms, substitutes, by_id)
+                update_plan_status(run)
+                return None
+            plan_id = event.get("plan_id")
+            run = plans_by_id.get(plan_id) if plan_id else None
+            if run is None:
+                return "unknown_plan"
+            if action == "stop_bundle":
+                # 人工停止：保留已执行集合与每项未执行原因。
+                run["events"].append({"at_ms": at_ms, "action": "stop_bundle"})
+                run["remaining_blocked_reason"] = "manual_stop"
+                run["stop_reason"] = "manual_stop"
+                for sid in list(run["remaining_ids"]):
+                    member = by_id[sid]
+                    run["members"].append({
+                        "at_ms": at_ms,
+                        "action": "stop_bundle",
+                        "plan_id": run["id"],
+                        "suggestion_id": sid,
+                        "precheck": precheck_snapshot(member, at_ms),
+                        "outcome": "skipped",
+                        "reason": "manual_stop",
+                    })
+                    plan_note_not_executed(run, sid, "manual_stop", at_ms)
+                update_plan_status(run)
+                return None
+            if action == "revise_budget":
+                # 预算突增/削减：新预算立即生效；已执行支出永久保留，
+                # 剩余计划若超出新预算则阻塞并记录原因。
+                new_budget = event.get("budget")
+                if new_budget is None:
+                    return "missing_budget"
+                new_budget = {
+                    "cost": (None if new_budget.get("cost") is None
+                             else float(new_budget["cost"])),
+                    "risk": (None if new_budget.get("risk") is None
+                             else float(new_budget["risk"])),
+                }
+                old_budget = run["budget"]
+                run["budget"] = new_budget
+                run["events"].append({
+                    "at_ms": at_ms,
+                    "action": "revise_budget",
+                    "old_budget": old_budget,
+                    "new_budget": new_budget,
+                    "spent_at_revision": dict(run["spent"]),
+                })
+                remaining = [by_id[sid] for sid in run["remaining_ids"]]
+                projection = project_plan(
+                    [m for m in remaining if m["status"] == "pending"],
+                    new_budget)
+                fits = True
+                if new_budget is not None:
+                    cap_cost = new_budget.get("cost")
+                    cap_risk = new_budget.get("risk")
+                    if (cap_cost is not None
+                            and run["spent"]["cost"]
+                            + projection["projected_cost"] > float(cap_cost)):
+                        fits = False
+                    if (cap_risk is not None
+                            and aggregate_plan_risk(
+                                run["executed_members"]
+                                + [by_id[sid] for sid in
+                                   projection["projected_executable_ids"]])
+                            > float(cap_risk)):
+                        fits = False
+                if not fits:
+                    run["remaining_blocked_reason"] = "budget_reduced"
+                    run["stop_reason"] = "budget_reduced"
+                    for sid in list(run["remaining_ids"]):
+                        plan_note_not_executed(run, sid, "budget_reduced", at_ms)
+                update_plan_status(run)
+                return None
+            if action == "resume_bundle":
+                # 重开：只继续经重新核对的剩余部分；已执行事实不变。
+                run["events"].append({"at_ms": at_ms, "action": "resume_bundle"})
+                run["remaining_blocked_reason"] = None
+                run["current_action"] = "resume_bundle"
+                for sid in list(run["remaining_ids"]):
+                    plan_attempt(run, by_id[sid], at_ms,
+                                 event.get("substitutes") or {}, by_id)
+                run["current_action"] = "plan_bundle"
+                update_plan_status(run)
+                return None
+            return "unknown_action"
+
         while queue:
             at_ms, order, _, kind, payload = heapq.heappop(queue)
             clock.advance_to(VirtualClock.ms_to_ns(at_ms))
@@ -494,6 +840,7 @@ class AdaptiveEngine:
                             "spec": self._injection_to_dict(spec),
                             "cost": float(template.get("cost", 0)),
                             "risk": float(template.get("risk", 0)),
+                            "risk_sources": list(template.get("risk_sources", [])),
                             "template": dict(template),
                             "status": "pending",
                             "events": [],
@@ -521,6 +868,16 @@ class AdaptiveEngine:
                 if action in ("confirm_bundle", "abandon_bundle"):
                     # 组合事件写入 bundle 审计与各成员 events，不使用单条 record。
                     ignore_reason = handle_bundle_event(event, action, at_ms)
+                    if ignore_reason is not None:
+                        record.update({"outcome": "ignored",
+                                       "reason": ignore_reason,
+                                       "suggestion_id": None})
+                    else:
+                        record = None
+                elif action in ("plan_bundle", "stop_bundle", "revise_budget",
+                                "resume_bundle"):
+                    # 剩余方案选择事件写入 plan 审计，不使用单条 record。
+                    ignore_reason = handle_plan_event(event, action, at_ms)
                     if ignore_reason is not None:
                         record.update({"outcome": "ignored",
                                        "reason": ignore_reason,
@@ -631,7 +988,7 @@ class AdaptiveEngine:
             raise RuntimeError("演练结束后仍有故障未恢复")
         expire_pending(horizon_ms if horizon_ms is not None else 0)
         return (observations, decisions, stopped, stop_reason, manager.history,
-                suggestions, bundle_runs)
+                suggestions, bundle_runs, plan_runs)
 
     def _decide(self, scenario, thresholds, observations, decision_index, at_ms,
                 horizon_ms, branch_id, escalated_failures, spent_cost, spent_risk,

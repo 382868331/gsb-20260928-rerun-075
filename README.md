@@ -45,6 +45,22 @@
   `partially_effective`，不会整体记成未执行。每条建议保留决策依据观察 `basis`、
   人工确认 `events` 与执行前复核；放弃组合与重新确认组合可作为两个独立分支比较，
   结果随报告保存并可重放（见报告中的 `bundles[]` 与 `tests/test_bundles.py`）。
+- **执行中变化条件下的剩余方案选择**：审批事件可用 `plan_bundle` 启动一组
+  相互依赖的干预，并在批准时给定组合级 `budget`（成本与风险）。执行每一项前
+  都按**最新状态**复核剩余候选（有效期、证据、互斥范围、全局限额与组合预算），
+  并显式比较两种方案——`original_order`（保持原顺序）与
+  `lower_risk_first`（低风险优先），两方案的预计可执行集合与成本/风险记入
+  `plan_comparison`，实际执行所选 `strategy`。已执行干预的成本与影响**永久计入**
+  本次组合（`spent` 只增不减），不因后续失败、撤回或重新排序而归零。替代项经
+  `substitutes` 指定，但必须是另一条独立待批准建议（独立批准依据），过期或已
+  失效的许可不能沿用。多项干预共享风险来源时按
+  `max_within_shared_source_sum_across_sources` 聚合：同一来源内取成员最大风险、
+  跨来源求和，既不简单相加也不重复折扣，避免伪可行方案。预算突增
+  （`revise_budget`）、证据缺失或人工停止（`stop_bundle`）时保留已执行集合与
+  每项未执行原因；`resume_bundle` 重开后只能继续经重新核对的剩余部分。
+  重复完成通知（同一批建议再次提交或重开）不会重复执行或重复计费，预算轨迹
+  `budget_trajectory` 保持不变（见报告中的 `plans[]` 与
+  `tests/test_remaining_plan.py`）。
 
 ## 目录结构
 
@@ -75,6 +91,10 @@
   --thresholds examples/adaptive_approval_thresholds.json \
   --approvals examples/adaptive_approvals_bundle.json \
   -o /tmp/adaptive_bundle.json
+.venv/bin/python -m chaos_platform adaptive-run examples/adaptive_approval.json \
+  --thresholds examples/adaptive_approval_thresholds.json \
+  --approvals examples/adaptive_approvals_plan.json \
+  -o /tmp/adaptive_plan.json
 .venv/bin/python -m chaos_platform replay /tmp/adaptive.json
 .venv/bin/python -m pytest -q
 ```

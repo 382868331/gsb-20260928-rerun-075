@@ -54,6 +54,13 @@ def _print_adaptive_summary(result: dict) -> None:
             print(f"  组合 @{bundle['at_ms']}ms [{bundle['mode']}] "
                   f"{bundle['status']}: 生效 {len(bundle.get('effective_suggestion_ids', []))}"
                   f"/{len(bundle['suggestion_ids'])}")
+        for plan in branch.get("plans", []):
+            spent = plan["spent"]
+            print(f"  方案 {plan['id']} @{plan['at_ms']}ms "
+                  f"[{plan['strategy']}] {plan['status']}: "
+                  f"生效 {len(plan.get('executed_suggestion_ids', []))}"
+                  f"/{len(plan['suggestion_ids'])}，"
+                  f"支出 cost={spent['cost']:g} risk={spent['risk']:g}")
 
 
 def main(argv: list[str] | None = None) -> int:
